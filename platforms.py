@@ -88,8 +88,10 @@ async def get_sberast_lots() -> list:
                     if price_m:
                         price = float(re.sub(r'\s', '', price_m.group(1)))
 
+                    _sber_id_m = re.search(r'id=(\w+)', href) if href else None
+                    _sber_id = _sber_id_m.group(1) if _sber_id_m else str(len(lots))
                     lots.append({
-                        "id": f"sber_{re.search(r'id=(\w+)', href or '').group(1) if href and re.search(r'id=(\w+)', href) else len(lots)}",
+                        "id": f"sber_{_sber_id}",
                         "title": text[:150].strip(),
                         "url": href or "",
                         "region": "moskva",
