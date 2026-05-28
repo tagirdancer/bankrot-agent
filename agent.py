@@ -29,8 +29,8 @@ REGIONS_MAIN  = ["moskva", "moskovskaya-oblast"]
 REGIONS_EXTRA = ["sankt-peterburg", "leningradskaya-oblast",
                  "krasnodar", "ekaterinburg", "novosibirsk"]
 
-MAX_PAGES   = 10
-MAX_LOTS    = 200
+MAX_PAGES   = 15
+MAX_LOTS    = 500
 TOP_N       = 15
 ALERT_SCORE = 9.0  # Только реально горячие
 
@@ -41,11 +41,11 @@ CATEGORIES = {
     "квартира":  {"icon":"🏠","label":"Квартиры",                 "min_score":0,   "default":True},
     "дом":       {"icon":"🏡","label":"Дома и дачи",              "min_score":0,   "default":True},
     "коммерция": {"icon":"🏢","label":"Коммерческая недвижимость","min_score":0,   "default":True},
-    "земля":     {"icon":"🌱","label":"Земельные участки",        "min_score":7.0, "default":True},
-    "авто":      {"icon":"🚗","label":"Транспорт",                "min_score":8.5, "default":False},
-    "гараж":     {"icon":"🅿️","label":"Гаражи",                  "min_score":8.5, "default":False},
-    "бизнес":    {"icon":"💼","label":"Бизнес/оборудование",      "min_score":8.5, "default":False},
-    "прочее":    {"icon":"📦","label":"Прочее",                   "min_score":9.0, "default":False},
+    "земля":     {"icon":"🌱","label":"Земельные участки",        "min_score":0, "default":True},
+    "авто":      {"icon":"🚗","label":"Транспорт",                "min_score":0, "default":False},
+    "гараж":     {"icon":"🅿️","label":"Гаражи",                  "min_score":0, "default":False},
+    "бизнес":    {"icon":"💼","label":"Бизнес/оборудование",      "min_score":0, "default":False},
+    "прочее":    {"icon":"📦","label":"Прочее",                   "min_score":0, "default":False},
 }
 
 
