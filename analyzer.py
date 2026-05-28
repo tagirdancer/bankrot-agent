@@ -19,11 +19,11 @@ MIN_SCORE = {
     "квартира":  0,
     "дом":       0,
     "коммерция": 0,
-    "земля":     7.0,
-    "авто":      8.0,
-    "гараж":     8.0,
-    "бизнес":    8.0,
-    "прочее":    8.5,
+    "земля":     0,
+    "авто":      0,
+    "гараж":     0,
+    "бизнес":    0,
+    "прочее":    0,
 }
 
 
@@ -178,6 +178,7 @@ async def get_lot_details(lot_url: str, page) -> dict:
         pass
     return details
 
+
 def calc_investment(lot_price: float, market_price: float,
                     rental_monthly: float, lot_type: str) -> dict:
     """Полный инвест-расчёт"""
@@ -235,7 +236,7 @@ async def call_groq(prompt: str, max_tokens: int = 700) -> str:
                     "model":    MODEL,
                     "messages": [{"role": "user", "content": prompt}],
                     "max_tokens": max_tokens,
-                    "temperature": 0.15,
+                    "temperature": 0.4,
                 }
             )
             data = resp.json()
@@ -252,6 +253,7 @@ async def analyze_lot(lot: dict) -> dict:
     pdf_text     = lot.get("pdf_text", "")
     lot_info     = lot.get("description", "")
     lot_price    = lot.get("price", 0)
+
     lot_type     = lot.get("category", "прочее")
     step_cur     = lot.get("step_current", 0)
     step_tot     = lot.get("step_total", 0)
@@ -361,6 +363,8 @@ async def analyze_lot(lot: dict) -> dict:
 
 Инвест-расчёт:
 {invest['summary']}
+
+ОБЯЗАТЕЛЬНО укажи реальную рыночную цену для данного типа объекта в данном регионе на основе своих знаний рынка 2024-2025 года. Не пиши 0 или null — дай конкретную цифру в поле market_price_rub.
 
 Дай экспертный анализ ИМЕННО ДЛЯ {type_label}.
 Ответь ТОЛЬКО JSON:
