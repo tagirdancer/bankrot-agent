@@ -1,16 +1,16 @@
 """
-Telegram бот v2.0 — с кнопками и диалогом
+Telegram бот v4.0 — удобное меню + запрос в любое время
 """
-import asyncio, os, re, json
+import asyncio, os, re
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, MessageHandler,
     CallbackQueryHandler, filters, ContextTypes
 )
 from dotenv import load_dotenv
-from analyzer import analyze_lot, detect_type
+from analyzer import analyze_lot, detect_type, get_lot_details
 from database import (get_portfolio, get_global_stats,
-                      add_to_portfolio, init_db, get_price_trend)
+                      add_to_portfolio, init_db, get_price_trend, save_lot)
 
 load_dotenv()
 
@@ -20,11 +20,90 @@ GROQ_KEY   = os.getenv("GROQ_API_KEY")
 GROQ_URL   = "https://api.groq.com/openai/v1/chat/completions"
 MODEL      = "llama-3.1-8b-instant"
 
-# Хранилище текущих анализов (в памяти)
 lot_cache = {}
 
+# Настройки пользователя
+settings = {
+    "budget_max":  0,
+    "min_score":   7.0,
+    "regions":     "all",  # all / main / extra
+}
 
-async def ask_expert(question: str) -> str:
+
+def main_menu() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("🚀 ЗАПУСТИТЬ АНАЛИЗ СЕЙЧАС",
+                                 callback_data="menu_run"),
+        ],
+        [
+            InlineKeyboardButton("🏠 Квартиры",    callback_data="run_квартира"),
+            InlineKeyboardButton("🏡 Дома",         callback_data="run_дом"),
+        ],
+        [
+            InlineKeyboardButton("🏢 Коммерция",   callback_data="run_коммерция"),
+            InlineKeyboardButton("🌱 Земля",         callback_data="run_земля"),
+        ],
+        [
+            InlineKeyboardButton("🚗 Авто",          callback_data="run_авто"),
+            InlineKeyboardButton("🅿️ Гаражи",       callback_data="run_гараж"),
+        ],
+        [
+            InlineKeyboardButton("💼 Бизнес",        callback_data="run_бизнес"),
+            InlineKeyboardButton("⚡ Горячие 9+",    callback_data="run_hot"),
+        ],
+        [
+            InlineKeyboardButton("📋 Мой портфель",  callback_data="portfolio"),
+            InlineKeyboardButton("📊 Статистика",    callback_data="stats"),
+        ],
+        [
+            InlineKeyboardButton("⚙️ Настройки",    callback_data="settings"),
+            InlineKeyboardButton("❓ Помощь",         callback_data="help"),
+        ],
+    ])
+
+
+def run_submenu(category: str) -> InlineKeyboardMarkup:
+    """Подменю после выбора категории"""
+    cat_names = {
+        "квартира":"🏠 Квартиры","дом":"🏡 Дома","коммерция":"🏢 Коммерция",
+        "земля":"🌱 Земля","авто":"🚗 Авто","гараж":"🅿️ Гаражи","бизнес":"💼 Бизнес",
+    }
+    label = cat_names.get(category, category)
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton(f"🔍 {label} — Москва и МО",
+                                 callback_data=f"exec_{category}_main"),
+        ],
+        [
+            InlineKeyboardButton(f"🌍 {label} — Все регионы (9+)",
+                                 callback_data=f"exec_{category}_all"),
+        ],
+        [
+            InlineKeyboardButton("↩️ Назад", callback_data="back_menu"),
+        ],
+    ])
+
+
+def lot_keyboard(lot_id: str, url: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("✅ Войти в лот",
+                                 callback_data=f"enter_{lot_id}"),
+            InlineKeyboardButton("👁 Наблюдать",
+                                 callback_data=f"watch_{lot_id}"),
+        ],
+        [
+            InlineKeyboardButton("📋 Как подать заявку",
+                                 callback_data=f"how_{lot_id}"),
+            InlineKeyboardButton("❌ Пропустить",
+                                 callback_data=f"skip_{lot_id}"),
+        ],
+        [InlineKeyboardButton("🔗 Открыть на сайте", url=url)],
+    ])
+
+
+async def ask_expert(q: str) -> str:
     import httpx
     try:
         async with httpx.AsyncClient(timeout=30) as client:
@@ -34,13 +113,9 @@ async def ask_expert(question: str) -> str:
                          "Content-Type": "application/json"},
                 json={
                     "model": MODEL,
-                    "messages": [{
-                        "role": "user",
-                        "content": f"""Ты эксперт-консультант по банкротным торгам России с 10-летним опытом.
-Отвечай кратко, конкретно, с эмодзи. Как профессионал инвестору.
-
-Вопрос: {question}"""
-                    }],
+                    "messages": [{"role":"user","content":
+                        f"Ты эксперт по банкротным торгам России. "
+                        f"Отвечай кратко, конкретно, с эмодзи.\n\n{q}"}],
                     "max_tokens": 500,
                     "temperature": 0.3,
                 }
@@ -49,347 +124,569 @@ async def ask_expert(question: str) -> str:
             if "choices" in data:
                 return data["choices"][0]["message"]["content"]
     except Exception as e:
-        return f"⚠️ Ошибка: {e}"
-    return "Не удалось получить ответ"
+        return f"⚠️ {e}"
+    return "Нет ответа"
 
 
-async def analyze_lot_url(url: str) -> tuple:
-    """Возвращает (lot, analysis)"""
-    from playwright.async_api import async_playwright
-    from analyzer import get_lot_details
+def build_lot_msg(lot: dict, an: dict, trend: dict = None) -> str:
+    disc  = f" | -{an.get('discount_pct','?')}%" if an.get('discount_pct','?') not in ('?','0') else ""
+    step  = f" | {an['step']}" if an.get('step') else ""
+    comp  = f"\n👥 {an['competition']}" if an.get('competition') else ""
+    extra = f"\n{an['extra_checks']}" if an.get('extra_checks') else ""
+    check = f"\n🔎 _{an.get('what_to_check','')}_" if an.get('what_to_check') else ""
+    trend_str = ""
+    if trend and trend.get("drop_pct",0) > 0:
+        trend_str = f"\n📉 -{trend['drop_pct']}% за {trend['days_tracked']} дн."
+    invest = {"высокий":"🔥","средний":"📈","низкий":"📉"}
+    risk   = {"низкий":"🟢","средний":"🟡","высокий":"🟠","критический":"🔴"}
+    region_note = f" 🌍 {lot.get('region','')}" if lot.get("is_extra_region") else ""
+    return (
+        f"*Балл: {an.get('total_score','?')}/10*"
+        f" {invest.get(an.get('invest_potential','средний'),'📈')}"
+        f" {risk.get(an.get('risk_level','средний'),'🟡')}"
+        f"{region_note}\n"
+        f"{lot.get('title','')[:65]}\n"
+        f"💰 {an.get('price','—')} → {an.get('market_price','—')}{disc}{step}"
+        f"{trend_str}{comp}\n"
+        f"💧 {an.get('liquidity_text','—')}\n"
+        f"📈 {an.get('roi_text','—')}\n"
+        f"⚖️ {an.get('legal_text','—')}"
+        f"{extra}{check}\n"
+        f"{an.get('action_emoji','⚠️')} *{an.get('action','?')}*\n"
+        f"💡 _{an.get('strategy','')}_\n"
+    )
+
+
+async def do_run(chat_id: str, bot, category: str = "все",
+                 extra_regions: bool = False, hot_only: bool = False):
+    """Реальный запуск анализа"""
     import pdfplumber, io
+    from playwright.async_api import async_playwright
+    from platforms import get_all_platform_lots
+    from agent import login_tbankrot, collect_lots, enrich, REGIONS_MAIN, REGIONS_EXTRA, ALERT_SCORE, CATEGORIES
 
-    lot_id_m = re.search(r'id=(\d+)', url)
-    lot_id = lot_id_m.group(1) if lot_id_m else "unknown"
-
-    lot = {
-        "id": lot_id, "title": "", "url": url,
-        "region": "moskva", "pdf_text": "",
-        "description": "", "price": 0,
-        "step_current": 0, "step_total": 0,
+    cat_icons = {
+        "квартира":"🏠","дом":"🏡","коммерция":"🏢","земля":"🌱",
+        "авто":"🚗","гараж":"🅿️","бизнес":"💼","все":"📦","горячие":"⚡"
     }
+    icon = cat_icons.get(category,"📦")
+
+    await bot.send_message(
+        chat_id=chat_id,
+        text=(
+            f"{icon} *Запускаю анализ: {category}*\n\n"
+            f"{'🌍 Все регионы' if extra_regions else '📍 Москва и МО'} | "
+            f"{'⚡ Только 9+' if hot_only else f'Балл {settings[\"min_score\"]}+'}\n\n"
+            f"_Займёт 15-25 минут. Горячие лоты пришлю сразу._"
+        ),
+        parse_mode="Markdown"
+    )
+
+    results = {}
+    cats_to_analyze = (
+        {category} if category not in ("все","горячие")
+        else set(CATEGORIES.keys())
+    )
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
-        ctx = await browser.new_context(user_agent=(
+        ctx     = await browser.new_context(user_agent=(
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
             "AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36"
         ))
         page = await ctx.new_page()
-        details = await get_lot_details(url, page)
-        lot.update({
-            "price":        details.get("price", 0),
-            "description":  details.get("description", ""),
-            "step_current": details.get("step_current", 0),
-            "step_total":   details.get("step_total", 0),
-        })
-        if details.get("title_full"):
-            lot["title"] = details["title_full"]
-        lot["category"] = detect_type(
-            f"{lot['title']} {lot['description'][:300]}"
+
+        await login_tbankrot(page)
+
+        regions = list(REGIONS_MAIN)
+        if extra_regions:
+            regions += REGIONS_EXTRA
+
+        lots = await collect_lots(page, regions, max_pages=8)
+        platform_lots = await get_all_platform_lots()
+        all_lots = lots + platform_lots
+
+        await bot.send_message(
+            chat_id=chat_id,
+            text=f"✅ Найдено *{len(all_lots)}* лотов — анализирую...",
+            parse_mode="Markdown"
         )
-        try:
-            resp = await ctx.request.get(
-                f"https://files.tbankrot.ru/egrn_files/{lot_id}.pdf"
-            )
-            if resp.status == 200:
-                with pdfplumber.open(io.BytesIO(await resp.body())) as pdf:
-                    lot["pdf_text"] = "\n".join(
-                        p.extract_text() or "" for p in pdf.pages[:4]
-                    )[:3000]
-        except:
-            pass
+
+        for lot in all_lots:
+            try:
+                await enrich(lot, page, ctx)
+                cat   = lot.get("category","прочее")
+                price = lot.get("price", 0)
+
+                if cat not in cats_to_analyze:
+                    continue
+                if settings["budget_max"] > 0 and price > settings["budget_max"]:
+                    continue
+
+                an    = await analyze_lot(lot)
+                score = float(an.get("total_score", 0))
+
+                min_s = ALERT_SCORE if hot_only else settings["min_score"]
+                if score < min_s:
+                    continue
+
+                # Доп. регионы — только 9+
+                if lot.get("is_extra_region") and score < ALERT_SCORE:
+                    continue
+
+                save_lot(lot, an)
+                trend = get_price_trend(lot["id"])
+
+                if cat not in results:
+                    results[cat] = []
+                results[cat].append((lot, an, trend))
+
+                # Горячие — отправляем сразу
+                if score >= ALERT_SCORE:
+                    lot_id = lot["id"]
+                    lot_cache[lot_id] = {"lot": lot, "analysis": an}
+                    msg = f"🔔 *ГОРЯЧИЙ ЛОТ {score}/10*\n\n" + build_lot_msg(lot, an, trend)
+                    kbd = lot_keyboard(lot_id, lot.get("url",""))
+                    await bot.send_message(
+                        chat_id=chat_id, text=msg,
+                        parse_mode="Markdown",
+                        reply_markup=kbd,
+                        disable_web_page_preview=True
+                    )
+
+            except:
+                continue
+            await asyncio.sleep(0.3)
+
         await browser.close()
 
-    analysis = await analyze_lot(lot)
-    return lot, analysis
+    # Итог
+    total = sum(len(v) for v in results.values())
+    if total == 0:
+        await bot.send_message(
+            chat_id=chat_id,
+            text="😔 Подходящих лотов не найдено.\nПопробуйте снизить балл в ⚙️ Настройках.",
+            reply_markup=main_menu()
+        )
+        return
 
+    # Отправляем топ-5 по каждой найденной категории
+    for cat, cat_results in results.items():
+        if not cat_results:
+            continue
+        cat_results.sort(key=lambda x: float(x[1].get("total_score",0)), reverse=True)
+        cat_info = CATEGORIES.get(cat, {"icon":"📦","label":cat})
+        icon_c   = cat_info["icon"]
+        label_c  = cat_info["label"]
+        text     = f"{icon_c} *{label_c} — топ {min(5,len(cat_results))}*\n\n"
 
-def build_lot_message(lot: dict, an: dict, trend: dict = None) -> str:
-    disc  = f" | -{an.get('discount_pct','?')}%" if an.get('discount_pct','?') not in ('?','0') else ""
-    step  = f"\n📊 {an['step']}" if an.get('step') else ""
-    check = f"\n🔎 _{an.get('what_to_check','')}_" if an.get('what_to_check') else ""
+        for i, (lot, an, trend) in enumerate(cat_results[:5]):
+            lot_id = lot["id"]
+            lot_cache[lot_id] = {"lot": lot, "analysis": an}
+            block  = build_lot_msg(lot, an, trend)
+            kbd    = lot_keyboard(lot_id, lot.get("url",""))
 
-    trend_str = ""
-    if trend and trend.get("drop_pct", 0) > 0:
-        trend_str = f"\n📉 История: -{trend['drop_pct']}% за {trend['days_tracked']} дн."
+            if len(text) + len(block) > 3500:
+                await bot.send_message(
+                    chat_id=chat_id, text=text,
+                    parse_mode="Markdown", disable_web_page_preview=True
+                )
+                text = block
+            else:
+                text += block
 
-    invest_icons = {"высокий":"🔥","средний":"📈","низкий":"📉"}
-    risk_icons   = {"низкий":"🟢","средний":"🟡","высокий":"🟠","критический":"🔴"}
+        if text.strip():
+            await bot.send_message(
+                chat_id=chat_id, text=text,
+                parse_mode="Markdown",
+                reply_markup=lot_keyboard(
+                    cat_results[0][0]["id"],
+                    cat_results[0][0].get("url","")
+                ),
+                disable_web_page_preview=True
+            )
+        await asyncio.sleep(1)
 
-    return (
-        f"🏷 *Анализ лота #{lot.get('id','')}*\n"
-        f"{lot.get('title','')[:70]}\n\n"
-        f"*Балл: {an.get('total_score','?')}/10*"
-        f" | {invest_icons.get(an.get('invest_potential','средний'),'📈')} {an.get('invest_potential','?')}"
-        f" | {risk_icons.get(an.get('risk_level','средний'),'🟡')} риск: {an.get('risk_level','?')}\n\n"
-        f"💰 {an.get('price','—')} → рынок {an.get('market_price','—')}{disc}"
-        f"{step}{trend_str}\n"
-        f"💧 {an.get('liquidity_text','—')}\n"
-        f"📈 {an.get('roi_text','—')}\n"
-        f"⚖️ {an.get('legal_text','—')}\n\n"
-        f"{an.get('action_emoji','⚠️')} *{an.get('action','?')}*\n"
-        f"💡 _{an.get('strategy','')}_"
-        f"{check}"
+    await bot.send_message(
+        chat_id=chat_id,
+        text=f"✅ *Анализ завершён!*\nНайдено: {total} лотов\n\nВыберите следующее действие:",
+        parse_mode="Markdown",
+        reply_markup=main_menu()
     )
-
-
-def build_lot_keyboard(lot_id: str, url: str) -> InlineKeyboardMarkup:
-    """Кнопки под каждым лотом"""
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("✅ Войти в лот",        callback_data=f"enter_{lot_id}"),
-            InlineKeyboardButton("⏳ Наблюдать",           callback_data=f"watch_{lot_id}"),
-        ],
-        [
-            InlineKeyboardButton("📋 Инструкция по подаче", callback_data=f"how_{lot_id}"),
-            InlineKeyboardButton("❌ Пропустить",           callback_data=f"skip_{lot_id}"),
-        ],
-        [
-            InlineKeyboardButton("🔗 Открыть на сайте",    url=url),
-        ]
-    ])
-
-
-# ─── Обработчик кнопок ──────────────────────────────────────
-
-async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    data = query.data
-
-    action, lot_id = data.rsplit("_", 1)
-    cached = lot_cache.get(lot_id, {})
-    lot = cached.get("lot", {})
-    an  = cached.get("analysis", {})
-
-    if action == "enter":
-        # Подтверждение входа
-        keyboard = InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton("✅ Да, подаю заявку", callback_data=f"confirm_{lot_id}"),
-                InlineKeyboardButton("↩️ Назад",            callback_data=f"back_{lot_id}"),
-            ]
-        ])
-        price = an.get("price", "уточните на сайте")
-        step  = an.get("step", "")
-        await query.edit_message_text(
-            f"⚠️ *Подтвердите решение*\n\n"
-            f"Лот: {lot.get('title','')[:60]}\n"
-            f"Цена: {price}"
-            f"{f' | {step}' if step else ''}\n\n"
-            f"Вы уверены что хотите войти в этот лот?",
-            parse_mode="Markdown",
-            reply_markup=keyboard
-        )
-
-    elif action == "confirm":
-        # Инструкция по подаче заявки
-        url = lot.get("url", "")
-        await query.edit_message_text(
-            f"📋 *Инструкция по подаче заявки*\n\n"
-            f"*Лот:* {lot.get('title','')[:60]}\n\n"
-            f"*Шаги:*\n"
-            f"1️⃣ Перейдите на сайт торгов по ссылке ниже\n"
-            f"2️⃣ Нажмите *«Подать заявку»*\n"
-            f"3️⃣ Приложите документы: паспорт + ИНН\n"
-            f"4️⃣ Внесите задаток на указанный счёт\n"
-            f"5️⃣ Дождитесь подтверждения заявки\n\n"
-            f"⚖️ *Юридика:* {an.get('legal_text','')}\n\n"
-            f"🔗 {url}\n\n"
-            f"_Лот добавлен в ваш портфель_ ✅",
-            parse_mode="Markdown",
-            disable_web_page_preview=True
-        )
-        # Добавляем в портфель
-        if lot and an:
-            add_to_portfolio(lot, an, notes="Решил войти через бот")
-
-    elif action == "watch":
-        if lot and an:
-            add_to_portfolio(lot, an, notes="Наблюдение")
-        await query.edit_message_text(
-            f"👁 *Добавлено в наблюдение*\n\n"
-            f"{lot.get('title','')[:60]}\n\n"
-            f"Агент будет следить за этим лотом и уведомит если цена снизится или торги заканчиваются.",
-            parse_mode="Markdown"
-        )
-
-    elif action == "how":
-        await query.edit_message_text(
-            f"📖 *Как участвовать в банкротных торгах*\n\n"
-            f"*1. Регистрация на ЭТП*\n"
-            f"Получите ЭЦП (электронную подпись) — от 3000 руб в УЦ\n\n"
-            f"*2. Аккредитация*\n"
-            f"Зарегистрируйтесь на площадке (Т-Банкрот, Сбербанк-АСТ и др.)\n\n"
-            f"*3. Задаток*\n"
-            f"Обычно 5-20% от начальной цены. Возвращается если не выиграли.\n\n"
-            f"*4. Заявка*\n"
-            f"Подайте заявку до окончания срока приёма\n\n"
-            f"*5. Торги*\n"
-            f"Аукцион (цена растёт) или Публичное предложение (цена падает)\n\n"
-            f"*6. Оплата*\n"
-            f"После победы — 30 дней на полную оплату\n\n"
-            f"💡 _Начните с небольших лотов для опыта_",
-            parse_mode="Markdown"
-        )
-
-    elif action == "skip":
-        await query.edit_message_text(
-            f"❌ Лот пропущен\n\n_{lot.get('title','')[:60]}_",
-            parse_mode="Markdown"
-        )
-
-    elif action == "back":
-        # Возврат к анализу
-        msg = build_lot_message(lot, an)
-        keyboard = build_lot_keyboard(lot_id, lot.get("url",""))
-        await query.edit_message_text(
-            msg, parse_mode="Markdown",
-            reply_markup=keyboard,
-            disable_web_page_preview=True
-        )
 
 
 # ─── Команды ────────────────────────────────────────────────
 
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("📊 Статистика",  callback_data="cmd_stats")],
-        [InlineKeyboardButton("📋 Мой портфель", callback_data="cmd_portfolio")],
-        [InlineKeyboardButton("❓ Как работают торги", callback_data="how_help")],
-    ])
     await update.message.reply_text(
-        "👋 *Привет! Я ваш эксперт по банкротным торгам.*\n\n"
-        "Что умею:\n"
-        "🔗 Скинь ссылку на лот → полный анализ + кнопки\n"
-        "❓ Задай вопрос → отвечу как эксперт\n"
-        "📊 /stats — статистика агента\n"
-        "📋 /portfolio — ваш портфель\n\n"
-        "_Попробуй скинуть ссылку с tbankrot.ru_ 👇",
+        "👋 *Добро пожаловать!*\n\n"
+        "Я ваш эксперт по банкротным торгам 🏆\n\n"
+        "• Нажмите кнопку — получите анализ\n"
+        "• Скиньте ссылку на лот — разберу\n"
+        "• Задайте вопрос — отвечу как эксперт\n\n"
+        "_Ежедневный дайджест приходит в 08:00_",
         parse_mode="Markdown",
-        reply_markup=keyboard
+        reply_markup=main_menu()
     )
 
 
-async def cmd_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    stats = get_global_stats()
-    cats  = "\n".join(f"  {cat}: {cnt}" for cat, cnt in stats.get("top_cats",[])[:5])
+async def cmd_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        f"📊 *Статистика агента*\n\n"
-        f"🔍 Изучено лотов: *{stats['total_lots']}*\n"
-        f"🔄 Запусков: *{stats['total_runs']}*\n"
-        f"🟢 «Входить» за 7 дней: *{stats['recent_go']}*\n\n"
-        f"*Топ категорий:*\n{cats}",
-        parse_mode="Markdown"
+        "📱 Главное меню:",
+        reply_markup=main_menu()
     )
 
 
-async def cmd_portfolio(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    items = get_portfolio()
-    if not items:
-        await update.message.reply_text(
-            "📋 *Портфель пуст*\n\n"
-            "Нажмите «Наблюдать» под любым лотом — он появится здесь.",
+# ─── Кнопки ─────────────────────────────────────────────────
+
+async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q       = update.callback_query
+    await q.answer()
+    data    = q.data
+    chat_id = str(q.message.chat_id)
+    bot     = ctx.bot
+
+    # Главное меню — выбор категории
+    if data == "menu_run":
+        await q.edit_message_text(
+            "📊 *Выберите что искать:*\n\n"
+            "_Или нажмите «ЗАПУСТИТЬ АНАЛИЗ СЕЙЧАС» для полного дайджеста_",
+            parse_mode="Markdown",
+            reply_markup=main_menu()
+        )
+
+    elif data == "back_menu":
+        await q.edit_message_text(
+            "📱 Главное меню:", reply_markup=main_menu()
+        )
+
+    # Выбор категории — показываем подменю
+    elif data.startswith("run_") and not data.startswith("run_hot"):
+        cat = data.replace("run_", "")
+        cat_names = {
+            "квартира":"🏠 Квартиры","дом":"🏡 Дома","коммерция":"🏢 Коммерция",
+            "земля":"🌱 Земля","авто":"🚗 Авто","гараж":"🅿️ Гаражи","бизнес":"💼 Бизнес",
+        }
+        await q.edit_message_text(
+            f"*{cat_names.get(cat,cat)}*\n\nВыберите регион:",
+            parse_mode="Markdown",
+            reply_markup=run_submenu(cat)
+        )
+
+    elif data == "run_hot":
+        await q.edit_message_text("⚡ Ищу только горячие лоты (балл 9+)...")
+        asyncio.create_task(do_run(chat_id, bot, "горячие", True, True))
+
+    # Запуск анализа
+    elif data.startswith("exec_"):
+        parts  = data.split("_")  # exec_квартира_main
+        cat    = parts[1]
+        region = parts[2] if len(parts) > 2 else "main"
+        extra  = region == "all"
+        await q.edit_message_text(
+            f"🔍 Запускаю анализ: *{cat}*...",
             parse_mode="Markdown"
         )
-        return
-    text = "📋 *Ваш портфель:*\n\n"
-    status_icons = {"watching":"👀","interested":"🔥","applied":"📝","won":"🏆","lost":"❌"}
-    for item in items[:8]:
-        icon = status_icons.get(item["status"], "📌")
-        text += (
-            f"{icon} {item['title'][:50]}\n"
-            f"💰 {item['buy_price']/1e6:.1f} млн → рынок {item['market_price']/1e6:.1f} млн\n"
-            f"🔗 {item['url']}\n\n"
+        asyncio.create_task(do_run(chat_id, bot, cat, extra, False))
+
+    # Лот — войти
+    elif data.startswith("enter_"):
+        lot_id = data[6:]
+        cached = lot_cache.get(lot_id, {})
+        lot    = cached.get("lot", {})
+        an     = cached.get("analysis", {})
+        await q.edit_message_text(
+            f"⚠️ *Подтвердите*\n\n"
+            f"{lot.get('title','')[:60]}\n"
+            f"💰 {an.get('price','—')}\n\n"
+            f"Войти в этот лот?",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("✅ Да, подаю заявку",
+                                     callback_data=f"confirm_{lot_id}"),
+                InlineKeyboardButton("↩️ Назад",
+                                     callback_data=f"back_{lot_id}"),
+            ]])
         )
-    await update.message.reply_text(text, parse_mode="Markdown",
-                                    disable_web_page_preview=True)
+
+    elif data.startswith("confirm_"):
+        lot_id = data[8:]
+        cached = lot_cache.get(lot_id, {})
+        lot    = cached.get("lot", {})
+        an     = cached.get("analysis", {})
+        if lot and an:
+            add_to_portfolio(lot, an, "Решил войти")
+        await q.edit_message_text(
+            f"📋 *Инструкция по подаче заявки*\n\n"
+            f"1️⃣ Перейдите по ссылке ниже\n"
+            f"2️⃣ Нажмите «Подать заявку»\n"
+            f"3️⃣ Документы: паспорт + ИНН\n"
+            f"4️⃣ Внесите задаток на указанный счёт\n"
+            f"5️⃣ Дождитесь подтверждения заявки\n\n"
+            f"⚖️ {an.get('legal_text','')}\n\n"
+            f"🔗 {lot.get('url','')}\n"
+            f"✅ _Добавлено в портфель_",
+            parse_mode="Markdown",
+            disable_web_page_preview=True
+        )
+
+    elif data.startswith("watch_"):
+        lot_id = data[6:]
+        cached = lot_cache.get(lot_id, {})
+        if cached.get("lot") and cached.get("analysis"):
+            add_to_portfolio(cached["lot"], cached["analysis"], "Наблюдение")
+        await q.edit_message_text(
+            "👁 *Добавлено в наблюдение*\n\n"
+            "Агент уведомит при изменении цены.",
+            parse_mode="Markdown"
+        )
+
+    elif data.startswith("how_"):
+        await q.edit_message_text(
+            "📖 *Как участвовать в торгах*\n\n"
+            "1️⃣ Получите ЭЦП (~3000 руб в УЦ)\n"
+            "2️⃣ Зарегистрируйтесь на ЭТП\n"
+            "3️⃣ Задаток: обычно 5-20% от цены\n"
+            "4️⃣ Подайте заявку до дедлайна\n"
+            "5️⃣ При победе — оплата в 30 дней\n\n"
+            "💡 _Начните с небольших лотов_",
+            parse_mode="Markdown"
+        )
+
+    elif data.startswith("skip_"):
+        lot_id = data[5:]
+        cached = lot_cache.get(lot_id, {})
+        lot    = cached.get("lot", {})
+        await q.edit_message_text(
+            f"❌ Пропущен\n_{lot.get('title','')[:60]}_",
+            parse_mode="Markdown"
+        )
+
+    elif data.startswith("back_"):
+        lot_id = data[5:]
+        cached = lot_cache.get(lot_id, {})
+        lot    = cached.get("lot", {})
+        an     = cached.get("analysis", {})
+        trend  = get_price_trend(lot_id) if lot_id else {}
+        msg    = build_lot_msg(lot, an, trend)
+        await q.edit_message_text(
+            msg, parse_mode="Markdown",
+            reply_markup=lot_keyboard(lot_id, lot.get("url","")),
+            disable_web_page_preview=True
+        )
+
+    # Статистика
+    elif data == "stats":
+        s    = get_global_stats()
+        cats = "\n".join(f"  {c}: {n}" for c,n in s.get("top_cats",[])[:5])
+        await q.edit_message_text(
+            f"📊 *Статистика*\n\n"
+            f"🔍 Изучено лотов: *{s['total_lots']}*\n"
+            f"🔄 Запусков: *{s['total_runs']}*\n"
+            f"🟢 «Входить» за 7 дней: *{s['recent_go']}*\n\n"
+            f"Топ категорий:\n{cats}",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("↩️ Меню", callback_data="back_menu")
+            ]])
+        )
+
+    # Портфель
+    elif data == "portfolio":
+        items = get_portfolio()
+        if not items:
+            text = "📋 *Портфель пуст*\n\nНажмите «Наблюдать» под любым лотом."
+        else:
+            text = "📋 *Ваш портфель:*\n\n"
+            icons = {"watching":"👀","interested":"🔥","applied":"📝","won":"🏆","lost":"❌"}
+            for item in items[:8]:
+                icon = icons.get(item["status"],"📌")
+                bp   = item["buy_price"]/1e6 if item["buy_price"] else 0
+                mp   = item["market_price"]/1e6 if item["market_price"] else 0
+                text += f"{icon} {item['title'][:45]}\n💰 {bp:.1f}→{mp:.1f} млн | {item['url']}\n\n"
+        await q.edit_message_text(
+            text, parse_mode="Markdown",
+            disable_web_page_preview=True,
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("↩️ Меню", callback_data="back_menu")
+            ]])
+        )
+
+    # Настройки
+    elif data == "settings":
+        budget = f"до {settings['budget_max']//1_000_000} млн" \
+                 if settings["budget_max"] > 0 else "без ограничений"
+        await q.edit_message_text(
+            f"⚙️ *Настройки*\n\n"
+            f"💰 Бюджет: {budget}\n"
+            f"⭐ Мин. балл: {settings['min_score']}\n\n"
+            f"Напишите: *бюджет 10* или *балл 8*",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("💰 До 5 млн",  callback_data="sb_5"),
+                 InlineKeyboardButton("💰 До 10 млн", callback_data="sb_10"),
+                 InlineKeyboardButton("💰 До 30 млн", callback_data="sb_30"),
+                 InlineKeyboardButton("💰 Без лимита",callback_data="sb_0")],
+                [InlineKeyboardButton("⭐ Балл 7+",   callback_data="ss_7"),
+                 InlineKeyboardButton("⭐ Балл 8+",   callback_data="ss_8"),
+                 InlineKeyboardButton("⭐ Балл 9+",   callback_data="ss_9")],
+                [InlineKeyboardButton("↩️ Меню",      callback_data="back_menu")],
+            ])
+        )
+
+    elif data.startswith("sb_"):
+        mlns = int(data[3:])
+        settings["budget_max"] = mlns * 1_000_000
+        note = f"до {mlns} млн ₽" if mlns > 0 else "без ограничений"
+        await q.answer(f"✅ Бюджет: {note}")
+
+    elif data.startswith("ss_"):
+        score = float(data[3:])
+        settings["min_score"] = score
+        await q.answer(f"✅ Минимальный балл: {score}+")
+
+    # Помощь
+    elif data == "help":
+        await q.edit_message_text(
+            "❓ *Как пользоваться*\n\n"
+            "🚀 *Запустить анализ* — полный дайджест всех категорий\n\n"
+            "🏠 *Категория* → выберите регион → получите топ-5 лотов\n\n"
+            "⚡ *Горячие 9+* — только исключительные лоты из всех регионов\n\n"
+            "🔗 *Скиньте ссылку* на любой лот — разберу детально\n\n"
+            "❓ *Задайте вопрос* — отвечу как эксперт по инвестициям\n\n"
+            "⚙️ *Настройки* — установите бюджет и минимальный балл\n\n"
+            "📋 *Портфель* — лоты которые наблюдаете\n\n"
+            "_Ежедневный дайджест недвижимости приходит в 08:00_",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("↩️ Меню", callback_data="back_menu")
+            ]])
+        )
 
 
 async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text or ""
+    text    = update.message.text or ""
+    chat_id = str(update.message.chat_id)
+    bot     = ctx.bot
+
+    # Бюджет
+    m = re.match(r'бюджет\s+(\d+)', text, re.IGNORECASE)
+    if m:
+        mlns = int(m.group(1))
+        settings["budget_max"] = mlns * 1_000_000
+        await update.message.reply_text(
+            f"✅ Бюджет: до {mlns} млн ₽",
+            reply_markup=main_menu()
+        )
+        return
+
+    # Балл
+    m = re.match(r'балл\s+([\d.]+)', text, re.IGNORECASE)
+    if m:
+        settings["min_score"] = float(m.group(1))
+        await update.message.reply_text(
+            f"✅ Минимальный балл: {settings['min_score']}+",
+            reply_markup=main_menu()
+        )
+        return
 
     # Ссылка на лот
     if "tbankrot.ru/item" in text or re.search(r'id=\d+', text):
         url_m = re.search(r'https?://\S+', text)
-        if url_m:
-            url = url_m.group()
-        else:
+        url   = url_m.group() if url_m else ""
+        if not url:
             id_m = re.search(r'id=(\d+)', text)
-            url = f"https://tbankrot.ru/item?id={id_m.group(1)}" if id_m else text
+            url  = f"https://tbankrot.ru/item?id={id_m.group(1)}" if id_m else ""
+        if url:
+            msg = await update.message.reply_text("⏳ Анализирую лот (~1 мин)...")
+            try:
+                import pdfplumber, io
+                from playwright.async_api import async_playwright
 
-        msg = await update.message.reply_text("⏳ Анализирую лот... (~1 минута)")
-        try:
-            lot, analysis = await analyze_lot_url(url)
-            lot_id = lot.get("id", "0")
+                lot_id = (re.search(r'id=(\d+)', url) or re.search(r'','')).group(1) \
+                         if re.search(r'id=(\d+)', url) else "0"
+                lot    = {
+                    "id": lot_id, "title": "", "url": url,
+                    "region": "moskva", "pdf_text": "",
+                    "description": "", "price": 0,
+                    "step_current":0,"step_total":0,
+                    "participants":0,"vin":"","cadastral":"",
+                    "is_extra_region": False, "source": "Т-Банкрот",
+                }
 
-            # Сохраняем в кэш для кнопок
-            lot_cache[lot_id] = {"lot": lot, "analysis": analysis}
+                async with async_playwright() as p:
+                    browser = await p.chromium.launch(headless=True)
+                    ctx2    = await browser.new_context()
+                    page    = await ctx2.new_page()
+                    details = await get_lot_details(url, page)
+                    lot.update({
+                        "price":        details.get("price",0),
+                        "description":  details.get("description",""),
+                        "step_current": details.get("step_current",0),
+                        "step_total":   details.get("step_total",0),
+                        "participants": details.get("participants",0),
+                        "vin":          details.get("vin",""),
+                        "cadastral":    details.get("cadastral",""),
+                    })
+                    if details.get("title_full"):
+                        lot["title"] = details["title_full"]
+                    lot["category"] = detect_type(
+                        f"{lot['title']} {lot['description'][:300]}"
+                    )
+                    try:
+                        resp = await ctx2.request.get(
+                            f"https://files.tbankrot.ru/egrn_files/{lot_id}.pdf"
+                        )
+                        if resp.status == 200:
+                            with pdfplumber.open(io.BytesIO(await resp.body())) as pdf:
+                                lot["pdf_text"] = "\n".join(
+                                    p.extract_text() or ""
+                                    for p in pdf.pages[:4]
+                                )[:3000]
+                    except:
+                        pass
+                    await browser.close()
 
-            # Получаем историю цены
-            from database import get_price_trend, save_lot
-            save_lot(lot, analysis)
-            trend = get_price_trend(lot_id)
+                an    = await analyze_lot(lot)
+                trend = get_price_trend(lot_id)
+                save_lot(lot, an)
+                lot_cache[lot_id] = {"lot": lot, "analysis": an}
 
-            result = build_lot_message(lot, analysis, trend)
-            keyboard = build_lot_keyboard(lot_id, url)
-
-            await msg.delete()
-            await update.message.reply_text(
-                result, parse_mode="Markdown",
-                reply_markup=keyboard,
-                disable_web_page_preview=True
-            )
-        except Exception as e:
-            await msg.edit_text(f"⚠️ Ошибка анализа: {e}")
+                result = build_lot_msg(lot, an, trend)
+                kbd    = lot_keyboard(lot_id, url)
+                await msg.delete()
+                await update.message.reply_text(
+                    result, parse_mode="Markdown",
+                    reply_markup=kbd,
+                    disable_web_page_preview=True
+                )
+            except Exception as e:
+                await msg.edit_text(f"⚠️ Ошибка: {e}")
         return
 
     # Вопрос эксперту
     if len(text) > 3:
-        msg = await update.message.reply_text("💭 Думаю...")
+        m2 = await update.message.reply_text("💭 Думаю...")
         answer = await ask_expert(text)
-        await msg.edit_text(answer)
-
-
-async def handle_inline_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Обработка кнопок из /start"""
-    query = update.callback_query
-    await query.answer()
-    if query.data == "cmd_stats":
-        stats = get_global_stats()
-        cats  = "\n".join(f"  {cat}: {cnt}" for cat, cnt in stats.get("top_cats",[])[:5])
-        await query.edit_message_text(
-            f"📊 *Статистика*\n\nИзучено: {stats['total_lots']} | Запусков: {stats['total_runs']}\n\n{cats}",
-            parse_mode="Markdown"
-        )
-    elif query.data == "cmd_portfolio":
-        await cmd_portfolio(update, ctx)
-    elif query.data == "how_help":
-        await query.edit_message_text(
-            "📖 *Как участвовать в торгах*\n\n"
-            "1. Получите ЭЦП (~3000 руб)\n"
-            "2. Зарегистрируйтесь на ЭТП\n"
-            "3. Внесите задаток (5-20% от цены)\n"
-            "4. Подайте заявку до дедлайна\n"
-            "5. При победе — оплата в течение 30 дней\n\n"
-            "_Скиньте ссылку на лот для анализа_ 👇",
-            parse_mode="Markdown"
+        await m2.edit_text(
+            answer,
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("📱 Меню", callback_data="back_menu")
+            ]])
         )
 
 
 def run_bot():
     init_db()
     app = Application.builder().token(TG_TOKEN).build()
-    app.add_handler(CommandHandler("start",     cmd_start))
-    app.add_handler(CommandHandler("stats",     cmd_stats))
-    app.add_handler(CommandHandler("portfolio", cmd_portfolio))
-    app.add_handler(CallbackQueryHandler(handle_inline_cmd,
-                    pattern="^cmd_|^how_help$"))
-    app.add_handler(CallbackQueryHandler(handle_callback,
-                    pattern="^(enter|confirm|watch|how|skip|back)_"))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    print("🤖 Бот v2.0 запущен! Отправьте /start в Telegram.")
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("menu",  cmd_menu))
+    app.add_handler(CommandHandler("m",     cmd_menu))
+    app.add_handler(CallbackQueryHandler(handle_callback))
+    app.add_handler(MessageHandler(
+        filters.TEXT & ~filters.COMMAND, handle_message
+    ))
+    print("🤖 Бот v4.0 запущен! Напишите /start в Telegram.")
     app.run_polling(drop_pending_updates=True)
 
 
