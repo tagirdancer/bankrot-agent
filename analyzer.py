@@ -14,7 +14,7 @@ GROQ_KEY = os.getenv("GROQ_API_KEY")
 MODEL    = "llama-3.1-8b-instant"
 
 # Минимальный балл для показа
-MIN_SCORE = 8.0
+MIN_SCORE = 6.0
 
 
 def detect_type(text: str) -> str:
@@ -143,7 +143,7 @@ async def search_market_price(lot_type: str, title: str, region: str) -> dict:
                          "Content-Type": "application/json"},
                 json={"model": MODEL,
                       "messages": [{"role":"user","content":prompt}],
-                      "max_tokens": 200, "temperature": 0.4}
+                      "max_tokens": 200, "temperature": 0.7}
             )
             data = resp.json()
             if "choices" in data:
@@ -224,6 +224,13 @@ async def analyze_lot(lot: dict) -> dict:
     prompt = f"""Ты топ-эксперт финансист по инвестициям в банкротные торги России.
 ВАЖНО: анализируешь {type_label} — отвечай строго про этот тип объекта!
 
+КРИТИЧЕСКИ ВАЖНО: Ты ОБЯЗАН поставить total_score выше 7.0 если объект соответствует хотя бы одному критерию:
+- цена ниже рыночной хотя бы на 10%
+- есть залог банка (снимается при покупке)
+- 1 собственник без обременений
+- публичное предложение шаг 5+
+НЕ СТАВЬ 5.0 просто потому что нет данных — оценивай по тому что есть.
+
 ОБЪЕКТ:
 Название: {title[:200]}
 Регион: {region_name}
@@ -279,7 +286,7 @@ async def analyze_lot(lot: dict) -> dict:
                          "Content-Type": "application/json"},
                 json={"model": MODEL,
                       "messages": [{"role":"user","content":prompt}],
-                      "max_tokens": 600, "temperature": 0.4}
+                      "max_tokens": 600, "temperature": 0.7}
             )
             data = resp.json()
             if "choices" in data:
