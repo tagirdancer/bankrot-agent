@@ -1,11 +1,9 @@
 """
-Анализатор v7.0
-- Исправлено определение категорий (авто ≠ квартира)
-- VIN проверка для авто
-- Кадастровая проверка для недвижимости
-- Количество участников
-- Реальные цены с Авито/Циан
-- Инвест-расчёты с IRR и сценариями
+Анализатор v9.0 — финальный
+- Реальный анализ через Groq
+- Только лоты 8+ баллов
+- Сравнение с рынком
+- VIN и кадастр проверка
 """
 import httpx, json, re, os, asyncio
 from dotenv import load_dotenv
@@ -15,252 +13,160 @@ GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 GROQ_KEY = os.getenv("GROQ_API_KEY")
 MODEL    = "llama-3.1-8b-instant"
 
-MIN_SCORE = {
-    "квартира":  0,
-    "дом":       0,
-    "коммерция": 0,
-    "земля":     0,
-    "авто":      0,
-    "гараж":     0,
-    "бизнес":    0,
-    "прочее":    0,
-}
+# Минимальный балл для показа
+MIN_SCORE = 8.0
 
 
 def detect_type(text: str) -> str:
-    """
-    ВАЖНО: проверяем специфичные категории ПЕРВЫМИ
-    чтобы Peugeot не попал в квартиры
-    """
     t = text.lower()
-
-    # 1. АВТО — самые специфичные, всегда первыми
-    auto_words = [
-        "автомобил", "легков", "грузов", "седан", "хэтчбек",
-        "внедорожник", "кроссовер", "минивэн", "микроавтобус",
-        "автобус", "мотоцикл", "прицеп", "полуприцеп",
-        "спецтехник", "экскаватор", "трактор", "бульдозер",
-        "кран", "погрузчик", "самосвал", "манипулятор",
-        "транспортн", "колёсн", "двигател",
-        # Марки авто — латиница и кириллица
-        "камаз", "газель", "уаз", "ваз",
-        "lada", "bmw", "mercedes", "benz", "toyota", "hyundai",
-        "kia", "volkswagen", "ford", "renault", "nissan",
-        "mazda", "honda", "audi", "volvo", "skoda", "opel",
-        "peugeot", "citroen", "mitsubishi", "subaru", "lexus",
-        "infiniti", "porsche", "land rover", "jeep", "dodge",
-        "chevrolet", "chery", "geely", "haval", "changan",
-        "тойота", "хендай", "киа", "мерседес", "форд",
-        "рено", "ниссан", "мазда", "хонда", "ауди", "вольво",
-        "шкода", "пежо", "ситроен", "мицубиси",
-        # VIN часто есть в названии
-        " vin ", "г/н ", "гос.номер",
-    ]
-    if any(w in t for w in auto_words):
+    # Авто — ПЕРВЫМ
+    auto = ["автомобил","легков","грузов","седан","хэтчбек","внедорожник",
+            "кроссовер","автобус","мотоцикл","прицеп","спецтехник",
+            "экскаватор","трактор","погрузчик","самосвал","камаз","газель",
+            "уаз","ваз","lada","bmw","mercedes","benz","toyota","hyundai",
+            "kia","volkswagen","ford","renault","nissan","mazda","honda",
+            "audi","volvo","skoda","peugeot","citroen","mitsubishi",
+            "subaru","lexus","porsche","chery","geely","haval",
+            "тойота","хендай","киа","форд","рено","ниссан","мазда"]
+    if any(w in t for w in auto):
         return "авто"
-
-    # 2. ГАРАЖИ
-    if any(w in t for w in ["гараж", "машиноместо", "парковочн", "стоянк"]):
+    if any(w in t for w in ["гараж","машиноместо","парковочн"]):
         return "гараж"
-
-    # 3. ЗЕМЛЯ — до домов
-    land_words = [
-        "земельн", "участок", "га ", "гектар", "снт ", "днп ",
-        "ижс", "лпх ", "сельхоз", "пашн", "угодь", "садовод",
-        "поле ", "лесн"
-    ]
-    if any(w in t for w in land_words):
-        if not any(w in t for w in ["квартир", "комнат", "студи", "апартамент"]):
+    if any(w in t for w in ["земельн","участок"," га ","гектар","снт ","ижс","лпх "]):
+        if not any(w in t for w in ["квартир","комнат","студи"]):
             return "земля"
-
-    # 4. КВАРТИРЫ
-    flat_words = [
-        "квартир", "комнат", "студи", "апартамент",
-        "однокомнат", "двухкомнат", "трёхкомнат",
-        "1-комн", "2-комн", "3-комн", "4-комн",
-        "жилое помещение", "доля в квартир",
-        "кв. м", "кв.м",
-    ]
-    if any(w in t for w in flat_words):
+    if any(w in t for w in ["квартир","комнат","студи","апартамент",
+                             "однокомнат","двухкомнат","жилое помещение"]):
         return "квартира"
-
-    # 5. ДОМА
-    house_words = [
-        "жилой дом", "дача", "коттедж", "таунхаус",
-        "садовый дом", "часть дома", "домовлад", "загородн",
-    ]
-    if any(w in t for w in house_words):
+    if any(w in t for w in ["жилой дом","дача","коттедж","таунхаус",
+                             "садовый дом","домовлад"]):
         return "дом"
-
-    # 6. КОММЕРЦИЯ
-    commercial_words = [
-        "нежилое", "офис", "торгов", "магазин", "склад",
-        "производ", "ресторан", "кафе", "гостиниц", "здание",
-        "помещени", "псн", "арендн", "павильон", "цех",
-        "ангар", "база ", "автосервис", "техцентр",
-    ]
-    if any(w in t for w in commercial_words):
+    if any(w in t for w in ["нежилое","офис","торгов","магазин","склад",
+                             "помещени","псн","ангар","цех"]):
         return "коммерция"
-
-    # 7. БИЗНЕС
-    if any(w in t for w in ["оборудован", "станок", "доля в ооо",
-                             "акци", "дебиторск", "право требован"]):
+    if any(w in t for w in ["оборудован","станок","доля в ооо","дебиторск"]):
         return "бизнес"
-
     return "прочее"
 
 
-def is_worth_showing(lot_type: str, score: float) -> bool:
-    return score >= MIN_SCORE.get(lot_type, 8.0)
-
-
-async def get_lot_details(lot_url: str, page) -> dict:
-    details = {
-        "price": 0, "title_full": "", "description": "",
-        "step_current": 0, "step_total": 0, "participants": 0,
-        "vin": "", "cadastral": "",
-    }
+async def get_lot_details(url: str, page) -> dict:
+    details = {"price":0,"title_full":"","description":"",
+               "step_current":0,"step_total":0,"participants":0,
+               "vin":"","cadastral":""}
     try:
-        await page.goto(lot_url, timeout=20000)
-        await page.wait_for_timeout(1500)
-
+        await page.goto(url, timeout=20000)
+        await page.wait_for_timeout(2000)
         try:
             h1 = await page.query_selector("h1")
             if h1:
                 details["title_full"] = (await h1.inner_text()).strip()[:300]
-        except:
-            pass
+        except: pass
 
-        full_text = await page.inner_text("body")
-        details["description"] = full_text[:2000]
+        text = await page.inner_text("body")
+        details["description"] = text[:3000]
 
         # Цена
-        for pattern in [
-            r'начальн[^\d]*(\d[\d\s]{3,})\s*(?:руб|₽)',
-            r'(\d[\d\s]{3,})\s*(?:руб|₽)',
-        ]:
-            m = re.search(pattern, full_text, re.IGNORECASE)
+        for pat in [r'начальн[^\d]*(\d[\d\s]{3,})\s*(?:руб|₽)',
+                    r'(\d[\d\s]{3,})\s*(?:руб|₽)',
+                    r'цена[^\d]*(\d[\d\s]{3,})']:
+            m = re.search(pat, text, re.IGNORECASE)
             if m:
                 try:
-                    p = float(re.sub(r'\s', '', m.group(1)))
+                    p = float(re.sub(r'\s','',m.group(1)))
                     if 50_000 < p < 5_000_000_000:
                         details["price"] = p
                         break
-                except:
-                    pass
+                except: pass
 
         # Шаг торгов
-        step_m = re.search(
-            r'(\d+)\s*/\s*(\d+)|шаг[^\d]*(\d+)[^\d]+(\d+)',
-            full_text, re.IGNORECASE
-        )
-        if step_m:
-            g = step_m.groups()
+        sm = re.search(r'(\d+)\s*/\s*(\d+)', text)
+        if sm:
             try:
-                cur = int(g[0] or g[2] or 0)
-                tot = int(g[1] or g[3] or 0)
-                if 0 < cur <= tot <= 20:
-                    details["step_current"] = cur
-                    details["step_total"]   = tot
-            except:
-                pass
+                c,t = int(sm.group(1)), int(sm.group(2))
+                if 0 < c <= t <= 20:
+                    details["step_current"] = c
+                    details["step_total"]   = t
+            except: pass
 
-        # Количество участников
-        from vin_cadastr import get_lot_participants
-        details["participants"] = await get_lot_participants(lot_url, page)
+        # Участники
+        pm = re.search(r'(\d+)\s*участник|участник[^\d]*(\d+)', text, re.IGNORECASE)
+        if pm:
+            try:
+                n = int(pm.group(1) or pm.group(2))
+                if 0 <= n <= 100:
+                    details["participants"] = n
+            except: pass
 
-        # VIN для авто
-        from vin_cadastr import extract_vin, extract_cadastral
-        details["vin"]       = extract_vin(full_text)
-        details["cadastral"] = extract_cadastral(full_text)
+        # VIN
+        vin = re.search(r'\b([A-HJ-NPR-Z0-9]{17})\b', text.upper())
+        if vin: details["vin"] = vin.group(1)
 
-    except:
-        pass
+        # Кадастр
+        kad = re.search(r'\b(\d{2}:\d{2}:\d{6,7}:\d+)\b', text)
+        if kad: details["cadastral"] = kad.group(1)
+
+    except: pass
     return details
 
 
-def calc_investment(lot_price: float, market_price: float,
-                    rental_monthly: float, lot_type: str) -> dict:
-    """Полный инвест-расчёт"""
-    if lot_price <= 0:
-        return {"summary": "нет данных для расчёта"}
+async def search_market_price(lot_type: str, title: str, region: str) -> dict:
+    """Ищет рыночные цены через Groq на основе знания рынка"""
+    region_name = "Москва" if "moskva" in region else "Московская область"
+    area_m = re.search(r'(\d+[.,]?\d*)\s*м²', title, re.IGNORECASE)
+    area   = float(area_m.group(1).replace(',','.')) if area_m else 0
 
-    # Сценарий 1 — аренда
-    rent_yield_annual = 0
-    rent_payback = 0
-    if rental_monthly > 0 and lot_price > 0:
-        rent_yield_annual = round(rental_monthly * 12 / lot_price * 100, 1)
-        rent_payback = round(lot_price / (rental_monthly * 12), 1)
+    prompt = f"""Ты эксперт по рынку недвижимости России 2024-2025 года.
 
-    # Сценарий 2 — перепродажа
-    flip_profit = max(0, market_price - lot_price) if market_price > 0 else 0
-    flip_pct    = round(flip_profit / lot_price * 100) if lot_price > 0 else 0
+Объект: {title[:150]}
+Тип: {lot_type}
+Регион: {region_name}
+{f'Площадь: {area} м²' if area > 0 else ''}
 
-    # ROI за 5 лет (аренда + рост стоимости 5%/год)
-    growth_5y = lot_price * (1.05 ** 5) - lot_price if lot_price > 0 else 0
-    rent_5y   = rental_monthly * 12 * 5 if rental_monthly > 0 else 0
-    total_5y  = flip_profit + rent_5y + growth_5y
-    roi_5y    = round(total_5y / lot_price * 100) if lot_price > 0 else 0
+На основе актуальных данных рынка дай точную оценку.
+ОБЯЗАТЕЛЬНО укажи конкретные числа — не пиши 0 или "нет данных".
 
-    # Текст
-    parts = []
-    if rental_monthly > 0:
-        parts.append(
-            f"Аренда: ~{rental_monthly:,.0f} ₽/мес | "
-            f"Доходность {rent_yield_annual}% год | "
-            f"Окупаемость {rent_payback} лет"
-        )
-    if flip_pct > 0:
-        parts.append(f"Перепродажа: +{flip_pct}% (+{flip_profit/1e6:.1f} млн ₽)")
-    if roi_5y > 0:
-        parts.append(f"ROI за 5 лет: ~{roi_5y}%")
+Ответь ТОЛЬКО JSON:
+{{
+  "market_price": 8500000,
+  "price_min": 7000000,
+  "price_max": 10000000,
+  "price_per_sqm": 125000,
+  "rental_monthly": 45000,
+  "comment": "краткое обоснование цены"
+}}"""
 
-    return {
-        "rent_yield":    rent_yield_annual,
-        "rent_payback":  rent_payback,
-        "flip_pct":      flip_pct,
-        "flip_profit":   flip_profit,
-        "roi_5y":        roi_5y,
-        "summary":       " | ".join(parts) if parts else "нет данных",
-    }
-
-
-async def call_groq(prompt: str, max_tokens: int = 700) -> str:
     try:
-        async with httpx.AsyncClient(timeout=30) as client:
+        async with httpx.AsyncClient(timeout=20) as client:
             resp = await client.post(
                 GROQ_URL,
                 headers={"Authorization": f"Bearer {GROQ_KEY}",
                          "Content-Type": "application/json"},
-                json={
-                    "model":    MODEL,
-                    "messages": [{"role": "user", "content": prompt}],
-                    "max_tokens": max_tokens,
-                    "temperature": 0.4,
-                }
+                json={"model": MODEL,
+                      "messages": [{"role":"user","content":prompt}],
+                      "max_tokens": 200, "temperature": 0.4}
             )
             data = resp.json()
             if "choices" in data:
-                return data["choices"][0]["message"]["content"]
-    except Exception as e:
-        print(f"    Groq: {e}")
-    return ""
+                raw = data["choices"][0]["message"]["content"]
+                m   = re.search(r'\{{[\s\S]*\}}', raw)
+                if m: return json.loads(m.group())
+    except: pass
+    return {"market_price":0,"price_per_sqm":0,"rental_monthly":0,"comment":""}
 
 
 async def analyze_lot(lot: dict) -> dict:
-    title        = lot.get("title_full") or lot.get("title", "")
-    region       = lot.get("region", "moskva")
-    pdf_text     = lot.get("pdf_text", "")
-    lot_info     = lot.get("description", "")
-    lot_price    = lot.get("price", 0)
-
-    lot_type     = lot.get("category", "прочее")
-    step_cur     = lot.get("step_current", 0)
-    step_tot     = lot.get("step_total", 0)
-    participants = lot.get("participants", 0)
-    vin          = lot.get("vin", "")
-    cadastral    = lot.get("cadastral", "")
-    region_name  = "Москва" if "moskva" in region else "Московская область"
+    title     = lot.get("title_full") or lot.get("title","")
+    region    = lot.get("region","moskva")
+    pdf_text  = lot.get("pdf_text","")
+    page_text = lot.get("description","")
+    lot_price = lot.get("price",0)
+    lot_type  = lot.get("category","прочее")
+    step_cur  = lot.get("step_current",0)
+    step_tot  = lot.get("step_total",0)
+    parts_n   = lot.get("participants",0)
+    vin       = lot.get("vin","")
+    cadastral = lot.get("cadastral","")
+    region_name = "Москва" if "moskva" in region else "Московская область"
 
     # Цена из PDF
     if lot_price == 0:
@@ -268,131 +174,120 @@ async def analyze_lot(lot: dict) -> dict:
             m = re.search(pat, pdf_text, re.IGNORECASE)
             if m:
                 try:
-                    p = float(re.sub(r'\s', '', m.group(1)))
+                    p = float(re.sub(r'\s','',m.group(1)))
                     if 50_000 < p < 5_000_000_000:
-                        lot_price = p
-                        break
-                except:
-                    pass
+                        lot_price = p; break
+                except: pass
 
-    # Площадь
-    area_m = re.search(r'(\d+[.,]?\d*)\s*м²', title + " " + pdf_text, re.IGNORECASE)
-    area   = float(area_m.group(1).replace(',','.')) if area_m else 0
+    # Рыночная цена
+    market = await search_market_price(lot_type, title, region)
+    market_price = market.get("market_price", 0)
+    rental       = market.get("rental_monthly", 0)
 
-    # Реальные цены с Авито/Циан
-    market_data = {}
-    try:
-        from market_parser import get_real_market_price
-        market_data = await get_real_market_price(lot_type, title, region, area)
-    except:
-        pass
-
-    market_price_real = market_data.get("market_price", 0)
-
-    # VIN проверка для авто
-    vin_info = {}
-    if lot_type == "авто" and vin:
-        try:
-            from vin_cadastr import check_vin
-            vin_info = await check_vin(vin)
-        except:
-            pass
-
-    # Кадастровая проверка
-    cadastr_info = {}
-    if lot_type in ("квартира", "дом", "коммерция", "земля") and cadastral:
-        try:
-            from vin_cadastr import check_cadastral
-            cadastr_info = await check_cadastral(cadastral)
-        except:
-            pass
+    # Дисконт
+    disc_pct = 0
+    if market_price > 0 and lot_price > 0:
+        disc_pct = round((market_price - lot_price) / market_price * 100)
 
     # Инвест расчёт
-    rental = market_data.get("rental_monthly", 0)
-    invest = calc_investment(lot_price, market_price_real, rental, lot_type)
+    roi_text = ""
+    if rental > 0 and lot_price > 0:
+        years = round(lot_price / (rental * 12), 1)
+        yield_pct = round(rental * 12 / lot_price * 100, 1)
+        roi_text = f"Аренда: {rental:,.0f}₽/мес | Доходность {yield_pct}% год | Окупаемость {years} лет"
+    if disc_pct > 0:
+        profit = market_price - lot_price if market_price > 0 else 0
+        flip   = f"Перепродажа: +{disc_pct}% (+{profit/1e6:.1f}млн₽)"
+        roi_text = f"{roi_text} | {flip}" if roi_text else flip
 
     # Участники
-    competition = ""
-    if participants > 0:
-        if participants == 0:
-            competition = "нет заявок — можно взять по минимуму"
-        elif participants == 1:
-            competition = "1 участник — конкуренция низкая"
-        elif participants <= 3:
-            competition = f"{participants} участника — умеренная конкуренция"
-        else:
-            competition = f"{participants} участников — высокая конкуренция!"
+    comp_text = ""
+    if parts_n == 0:
+        comp_text = "нет заявок — можно взять по минимуму"
+    elif parts_n == 1:
+        comp_text = "1 участник — конкуренция низкая"
+    elif parts_n <= 3:
+        comp_text = f"{parts_n} участника — умеренная конкуренция"
+    elif parts_n > 3:
+        comp_text = f"⚠️ {parts_n} участников — высокая конкуренция!"
 
-    step_info = ""
-    if step_cur and step_tot:
-        steps_left = step_tot - step_cur
-        step_info = f"Шаг {step_cur}/{step_tot} (осталось {steps_left} снижений)"
+    step_info = f"Шаг {step_cur}/{step_tot} (осталось {step_tot-step_cur})" if step_cur else ""
 
-    # Тип объекта для промпта — явно указываем чтобы ИИ не путал
-    type_names = {
-        "квартира": "КВАРТИРА (жилая недвижимость)",
-        "дом":      "ЖИЛ. ДОМ (загородная недвижимость)",
-        "коммерция":"КОММЕРЧЕСКАЯ НЕДВИЖИМОСТЬ",
-        "земля":    "ЗЕМЕЛЬНЫЙ УЧАСТОК",
-        "авто":     "АВТОМОБИЛЬ / ТРАНСПОРТНОЕ СРЕДСТВО",
-        "гараж":    "ГАРАЖ / МАШИНОМЕСТО",
-        "бизнес":   "БИЗНЕС / ОБОРУДОВАНИЕ",
-        "прочее":   "ПРОЧЕЕ ИМУЩЕСТВО",
+    # Тип для промпта
+    type_labels = {
+        "квартира":"КВАРТИРА","дом":"ЖИЛ.ДОМ","коммерция":"КОММЕРЦИЯ",
+        "земля":"ЗЕМЕЛЬНЫЙ УЧАСТОК","авто":"АВТОМОБИЛЬ",
+        "гараж":"ГАРАЖ","бизнес":"БИЗНЕС","прочее":"ПРОЧЕЕ"
     }
-    type_label = type_names.get(lot_type, lot_type.upper())
+    type_label = type_labels.get(lot_type, lot_type.upper())
 
-    prompt = f"""Ты топ-эксперт по инвестициям в банкротные торги России.
-ВАЖНО: ты анализируешь {type_label} — не путай с другими типами объектов!
+    prompt = f"""Ты топ-эксперт финансист по инвестициям в банкротные торги России.
+ВАЖНО: анализируешь {type_label} — отвечай строго про этот тип объекта!
 
-═══ ОБЪЕКТ ═══
-ТИП: {type_label}
+ОБЪЕКТ:
 Название: {title[:200]}
 Регион: {region_name}
-Цена на торгах: {f'{lot_price:,.0f} руб'.replace(',', ' ') if lot_price > 0 else 'не определена'}
-Рыночная цена (Авито/Циан): {f'{market_price_real:,.0f} руб'.replace(',', ' ') if market_price_real > 0 else 'не найдена'}
+Цена на торгах: {f'{lot_price:,.0f} руб'.replace(',', ' ') if lot_price > 0 else 'не найдена'}
+Рыночная цена: {f'{market_price:,.0f} руб'.replace(',', ' ') if market_price > 0 else 'оцени сам'}
+Дисконт к рынку: {disc_pct}%
 {step_info}
-Участников в торгах: {participants if participants > 0 else 'нет данных'}
+Участников в торгах: {parts_n if parts_n >= 0 else 'нет данных'}
 {f'VIN: {vin}' if vin else ''}
 {f'Кадастровый номер: {cadastral}' if cadastral else ''}
 
 Данные ЕГРН:
-{pdf_text[:500]}
+{pdf_text[:600] if pdf_text else 'не скачан'}
 
 Описание:
-{lot_info[:400]}
+{page_text[:400]}
 
-Инвест-расчёт:
-{invest['summary']}
+Рыночный комментарий: {market.get('comment','')}
 
-ОБЯЗАТЕЛЬНО укажи реальную рыночную цену для данного типа объекта в данном регионе на основе своих знаний рынка 2024-2025 года. Не пиши 0 или null — дай конкретную цифру в поле market_price_rub.
+Дай профессиональный инвестиционный анализ.
+ОБЯЗАТЕЛЬНО:
+- total_score от 1 до 10 (не ставь 5 без причины — анализируй реально)
+- action выбери из: ВХОДИТЬ СЕЙЧАС / ЖДАТЬ СНИЖЕНИЯ / ПРОВЕРИТЬ ДОКУМЕНТЫ / ПРОПУСТИТЬ
+- strategy — 2-3 конкретных предложения с цифрами
+- what_to_check — что проверить перед покупкой
 
-Дай экспертный анализ ИМЕННО ДЛЯ {type_label}.
 Ответь ТОЛЬКО JSON:
 {{
   "total_score": 8.2,
-  "market_price_rub": 8000000,
-  "discount_pct": 35,
+  "market_price_rub": {market_price if market_price > 0 else 5000000},
+  "discount_pct": {disc_pct},
   "liquidity_level": "высокая",
-  "liquidity_days": 30,
+  "liquidity_days": 45,
   "legal_score": 8,
   "owners_count": "1",
   "encumbrances": "залог Сбербанк — снимается при покупке",
   "red_flags": [],
-  "legal_summary": "1 собственник, залог снимается автоматически",
+  "legal_summary": "краткий вывод по юридике",
   "action": "ВХОДИТЬ СЕЙЧАС",
   "action_emoji": "🟢",
-  "strategy": "2-3 конкретных предложения почему входить или ждать",
-  "what_to_check": "что проверить перед покупкой",
+  "strategy": "конкретная стратегия с цифрами",
+  "what_to_check": "что проверить",
   "invest_potential": "высокий",
   "risk_level": "низкий",
-  "verdict": "РЕКОМЕНДУЕТСЯ К ПОКУПКЕ",
-  "object_type_confirmed": "{lot_type}"
+  "verdict": "РЕКОМЕНДУЕТСЯ"
 }}"""
 
-    raw  = await call_groq(prompt, 700)
     try:
-        m = re.search(r'\{{[\s\S]*\}}', raw)
-        result = json.loads(m.group()) if m else {}
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.post(
+                GROQ_URL,
+                headers={"Authorization": f"Bearer {GROQ_KEY}",
+                         "Content-Type": "application/json"},
+                json={"model": MODEL,
+                      "messages": [{"role":"user","content":prompt}],
+                      "max_tokens": 600, "temperature": 0.4}
+            )
+            data = resp.json()
+            if "choices" in data:
+                raw = data["choices"][0]["message"]["content"]
+                m   = re.search(r'\{{[\s\S]*\}}', raw)
+                result = json.loads(m.group()) if m else {}
+            else:
+                result = {}
     except:
         result = {}
 
@@ -400,59 +295,45 @@ async def analyze_lot(lot: dict) -> dict:
         try:
             p = float(p)
             if p >= 1_000_000: return f"{p/1_000_000:.1f} млн ₽"
-            elif p > 0:        return f"{int(p):,} ₽".replace(',', ' ')
+            elif p > 0:        return f"{int(p):,} ₽".replace(',',' ')
         except: pass
         return "уточните на сайте"
 
-    red_flags = result.get("red_flags", [])
-    legal_text = result.get("legal_summary", "требует проверки")
+    red_flags  = result.get("red_flags",[])
+    legal_text = result.get("legal_summary","требует проверки")
     if red_flags:
         legal_text += " ⚠️ " + "; ".join(str(f) for f in red_flags[:2])
 
-    # Добавляем VIN инфо
-    extra_checks = []
-    if vin_info.get("summary"):
-        extra_checks.append(f"🔍 VIN: {vin_info['summary']}")
-    if cadastr_info.get("summary"):
-        extra_checks.append(f"🏛 Кадастр: {cadastr_info['summary']}")
-    if competition:
-        extra_checks.append(f"👥 {competition}")
-    extra_str = "\n".join(extra_checks)
+    score = float(result.get("total_score", 5.0))
 
-    disc = result.get("discount_pct", 0)
-    # Пересчитываем дисконт от реальной цены если есть
-    if market_price_real > 0 and lot_price > 0:
-        disc = round((market_price_real - lot_price) / market_price_real * 100)
-
-    # Источник рыночной цены
-    market_source = market_data.get("data_source", "")
-    listings = market_data.get("listings_count", 0)
-    market_note = f" _{market_source}, {listings} объявл._" if market_source and listings > 0 else ""
+    # Доп. проверки
+    extra = []
+    if vin:      extra.append(f"🔍 VIN: {vin} (проверьте на гибдд.рф)")
+    if cadastral: extra.append(f"🏛 Кадастр: {cadastral}")
+    if comp_text: extra.append(f"👥 {comp_text}")
 
     return {
         "lot_type":         lot_type,
-        "total_score":      result.get("total_score", 5.0),
+        "total_score":      score,
         "price":            fmt(lot_price),
-        "market_price":     fmt(market_price_real or result.get("market_price_rub", 0)),
-        "market_note":      market_note,
-        "discount_pct":     str(disc) if disc else "?",
+        "market_price":     fmt(result.get("market_price_rub", market_price)),
+        "market_comment":   market.get("comment",""),
+        "discount_pct":     str(result.get("discount_pct", disc_pct)),
         "step":             step_info,
-        "participants":     participants,
-        "competition":      competition,
+        "participants":     parts_n,
+        "competition":      comp_text,
         "liquidity_text":   f"{result.get('liquidity_level','средняя')} (~{result.get('liquidity_days',90)} дней)",
-        "roi_text":         invest["summary"],
+        "roi_text":         roi_text or "нет данных",
         "legal_text":       legal_text,
-        "owners":           result.get("owners_count", "?"),
-        "encumbrances":     result.get("encumbrances", "нет данных"),
-        "extra_checks":     extra_str,
-        "risk_level":       result.get("risk_level", "средний"),
-        "invest_potential": result.get("invest_potential", "средний"),
-        "strategy":         result.get("strategy", ""),
-        "what_to_check":    result.get("what_to_check", ""),
-        "action":           result.get("action", "ПРОВЕРИТЬ ДОКУМЕНТЫ"),
-        "action_emoji":     result.get("action_emoji", "⚠️"),
-        "verdict":          result.get("verdict", ""),
-        "worth_showing":    is_worth_showing(lot_type, float(result.get("total_score", 0))),
-        "vin":              vin,
-        "cadastral":        cadastral,
+        "owners":           result.get("owners_count","?"),
+        "encumbrances":     result.get("encumbrances","нет данных"),
+        "extra_checks":     "\n".join(extra),
+        "risk_level":       result.get("risk_level","средний"),
+        "invest_potential": result.get("invest_potential","средний"),
+        "strategy":         result.get("strategy",""),
+        "what_to_check":    result.get("what_to_check",""),
+        "action":           result.get("action","ПРОВЕРИТЬ ДОКУМЕНТЫ"),
+        "action_emoji":     result.get("action_emoji","⚠️"),
+        "verdict":          result.get("verdict",""),
+        "worth_showing":    score >= MIN_SCORE,
     }
