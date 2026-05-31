@@ -1,27 +1,30 @@
-name: Bankrot Agent
+name: Bankrot Agent v9
+
 on:
   schedule:
     - cron: '0 5 * * *'
   workflow_dispatch:
     inputs:
       category:
-        description: 'Категория (все/квартира/дом/коммерция/земля/авто)'
+        description: 'все/квартира/дом/коммерция/земля/авто'
         required: false
         default: 'все'
+
 jobs:
-  run-agent:
-    runs-on: ubuntu-22.04
+  agent:
+    runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      - name: Устанавливаем зависимости
+      - name: Установка
         run: |
-          pip install -r requirements.txt
-          playwright install --with-deps chromium
-      - name: Запускаем агента
+          pip install playwright httpx pdfplumber python-telegram-bot python-dotenv schedule
+          playwright install chromium
+          playwright install-deps chromium
+      - name: Запуск
         env:
           TBANKROT_LOGIN:    ${{ secrets.TBANKROT_LOGIN }}
           TBANKROT_PASSWORD: ${{ secrets.TBANKROT_PASSWORD }}
