@@ -14,7 +14,7 @@ GROQ_KEY = os.getenv("GROQ_API_KEY")
 MODEL    = "llama-3.1-8b-instant"
 
 # Минимальный балл для показа
-MIN_SCORE = 6.0
+MIN_SCORE = 0.0
 
 
 def detect_type(text: str) -> str:
