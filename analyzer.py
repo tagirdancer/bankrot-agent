@@ -173,8 +173,10 @@ async def analyze_lot(lot: dict) -> dict:
 
     # Дисконт
     disc_pct = 0
-    if market_price > 0 and lot_price > 0:
+    if market_price > 0 and lot_price > 0 and market_price > lot_price:
         disc_pct = round((market_price - lot_price) / market_price * 100)
+    elif market_price > 0 and lot_price > market_price:
+        disc_pct = 0  # цена выше рынка — нет дисконта
 
     # Инвест расчёт
     roi_text = ""
@@ -249,9 +251,17 @@ async def analyze_lot(lot: dict) -> dict:
 - strategy — 2-3 конкретных предложения с цифрами
 - what_to_check — что проверить перед покупкой
 
+ПРАВИЛО ОЦЕНКИ — строго следуй:
+Если дисконт > 30% → total_score минимум 8.0
+Если дисконт 20-30% → total_score минимум 7.0
+Если дисконт 10-20% → total_score минимум 6.5
+Если участников 0 → добавь +0.5 к баллу
+Если есть кадастровый номер → добавь +0.3
+НЕ СТАВЬ 5.0 — это значит ты не проанализировал объект
+
 Ответь ТОЛЬКО JSON:
 {{
-  "total_score": 8.2,
+  "total_score": 7.5,
   "market_price_rub": {market_price if market_price > 0 else 5000000},
   "discount_pct": {disc_pct},
   "liquidity_level": "высокая",
