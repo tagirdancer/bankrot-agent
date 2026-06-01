@@ -132,6 +132,10 @@ async def enrich(lot, page, ctx):
                 )[:4000]
             print(f"    📄 ЕГРН скачан")
     except: pass
+    # Если PDF не скачался — берём данные со страницы лота
+    if not lot.get("pdf_text") and lot.get("description"):
+        lot["pdf_text"] = lot["description"][:2000]
+        print(f"    📝 Используем описание страницы вместо PDF")
 
 
 def fmt_block(lot, an, i=0) -> str:
