@@ -150,6 +150,7 @@ def fmt_block(lot, an, i=0) -> str:
     check  = f"\n🔎 _{an['what_to_check']}_" if an.get('what_to_check') else ""
     encumb = f"\n🔒 {an['encumbrances']}" if an.get('encumbrances') else ""
     exit_s = f"\n🚪 Выход: {an['exit_strategy']}" if an.get('exit_strategy') else ""
+    pdf_ok = "\n📄 _Документы проверены_" if an.get('has_pdf') else ""
     region_note = " 🌍" if lot.get("is_extra") else ""
     return (
         f"{medal} *{an.get('score_label','5/10')}*"
@@ -162,7 +163,7 @@ def fmt_block(lot, an, i=0) -> str:
         f"💧 Ликвидность: {an.get('liquidity_text','—')}\n"
         f"📈 {an.get('roi_text','нет данных')}\n"
         f"⚖️ {an.get('legal_text','—')}"
-        f"{encumb}"
+        f"{encumb}{pdf_ok}"
         f"{exit_s}"
         f"{extra}\n"
         f"{an.get('action_emoji','⚠️')} *{an.get('action','?')}*\n"
