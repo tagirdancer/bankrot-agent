@@ -141,36 +141,36 @@ async def enrich(lot, page, ctx):
 def fmt_block(lot, an, i=0) -> str:
     medals = ["🥇","🥈","🥉","4️⃣","5️⃣","6️⃣","7️⃣","8️⃣","9️⃣","🔟",
               "1️⃣1️⃣","1️⃣2️⃣","1️⃣3️⃣","1️⃣4️⃣","1️⃣5️⃣"]
-    medal = medals[i] if i < len(medals) else f"#{i+1}"
-    disc  = f" | -{an.get('discount_pct','?')}%" if an.get('discount_pct','?') not in ('?','0','0') else ""
-    step  = f"\n📊 {an['step']}" if an.get('step') else ""
-    comp  = f"\n👥 {an['competition']}" if an.get('competition') else ""
-    extra = f"\n{an['extra_checks']}" if an.get('extra_checks') else ""
-    check = f"\n🔎 _{an['what_to_check']}_" if an.get('what_to_check') else ""
+    medal  = medals[i] if i < len(medals) else f"#{i+1}"
+    disc   = an.get('discount_pct','0')
+    disc_s = f" | -{disc}%" if disc not in ('0','?','') else ""
+    step   = f"\n📊 {an['step']}" if an.get('step') else ""
+    mkt    = f"\n_📊 {an['market_comment']}_" if an.get('market_comment') else ""
+    extra  = f"\n{an['extra_checks']}" if an.get('extra_checks') else ""
+    check  = f"\n🔎 _{an['what_to_check']}_" if an.get('what_to_check') else ""
+    exit_s = f"\n🚪 Стратегия выхода: {an['exit_strategy']}" if an.get('exit_strategy') else ""
+    encumb = f"\n🔒 {an['encumbrances']}" if an.get('encumbrances') and an['encumbrances'] not in ('нет данных','уточните на сайте') else ""
     region_note = " 🌍" if lot.get("is_extra") else ""
-    mkt_note = f"\n_📊 {an.get('market_comment','')}_" if an.get('market_comment') else ""
-
-    invest = {"высокий":"🔥","средний":"📈","низкий":"📉"}
-    risk   = {"низкий":"🟢","средний":"🟡","высокий":"🟠","критический":"🔴"}
-
     return (
-        f"{medal} *Балл: {an.get('total_score','?')}/10*"
-        f" | {invest.get(an.get('invest_potential','средний'),'📈')} {an.get('invest_potential','?')}"
-        f" | {risk.get(an.get('risk_level','средний'),'🟡')} риск: {an.get('risk_level','?')}"
+        f"{medal} *{an.get('score_label','5/10')}*"
+        f" | {an.get('invest_text','📈 средний')}"
+        f" | {an.get('risk_text','🟡 средний')}"
         f"{region_note}\n"
         f"{lot.get('title','')[:65]}\n"
-        f"💰 {an.get('price','—')} → рынок {an.get('market_price','—')}{disc}{mkt_note}"
-        f"{step}{comp}\n"
-        f"💧 {an.get('liquidity_text','—')}\n"
-        f"📈 {an.get('roi_text','—')}\n"
-        f"⚖️ {an.get('legal_text','—')}"
-        f"{extra}{check}\n"
+        f"💰 {an.get('price','—')} → рынок {an.get('market_price','—')}{disc_s}"
+        f"{mkt}{step}\n"
+        f"💧 Ликвидность: {an.get('liquidity_text','—')}\n"
+        f"📈 {an.get('roi_text','нет данных')}\n"
+        f"⚖️ Юридика: {an.get('legal_text','—')}"
+        f"{encumb}"
+        f"{exit_s}"
+        f"{extra}\n"
         f"{an.get('action_emoji','⚠️')} *{an.get('action','?')}*\n"
-        f"💡 _{an.get('strategy','')}_\n"
+        f"💡 _{an.get('strategy','')}_"
+        f"{check}\n"
         f"🔗 {lot.get('url','')}\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
     )
-
 
 def build_msgs(cat_key, results) -> list:
     cat  = CATEGORIES[cat_key]
