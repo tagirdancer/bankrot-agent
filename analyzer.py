@@ -110,48 +110,35 @@ async def get_lot_details(url: str, page) -> dict:
 
 
 async def search_market_price(lot_type: str, title: str, region: str) -> dict:
-    """Ищет рыночные цены через Groq на основе знания рынка"""
     region_name = "Москва" if "moskva" in region else "Московская область"
-    area_m = re.search(r'(\d+[.,]?\d*)\s*м²', title, re.IGNORECASE)
-    area   = float(area_m.group(1).replace(',','.')) if area_m else 0
-
-    prompt = f"""Ты эксперт по рынку недвижимости России 2024-2025 года.
-
-Объект: {title[:150]}
-Тип: {lot_type}
-Регион: {region_name}
-{f'Площадь: {area} м²' if area > 0 else ''}
-
-На основе актуальных данных рынка дай точную оценку.
-ОБЯЗАТЕЛЬНО укажи конкретные числа — не пиши 0 или "нет данных".
-
-Ответь ТОЛЬКО JSON:
-{{
-  "market_price": 8500000,
-  "price_min": 7000000,
-  "price_max": 10000000,
-  "price_per_sqm": 125000,
-  "rental_monthly": 45000,
-  "comment": "краткое обоснование цены"
-}}"""
-
-    try:
-        async with httpx.AsyncClient(timeout=20) as client:
-            resp = await client.post(
-                GROQ_URL,
-                headers={"Authorization": f"Bearer {GROQ_KEY}",
-                         "Content-Type": "application/json"},
-                json={"model": MODEL,
-                      "messages": [{"role":"user","content":prompt}],
-                      "max_tokens": 200, "temperature": 0.7}
-            )
-            data = resp.json()
-            if "choices" in data:
-                raw = data["choices"][0]["message"]["content"]
-                m   = re.search(r'\{{[\s\S]*\}}', raw)
-                if m: return json.loads(m.group())
-    except: pass
-    return {"market_price":0,"price_per_sqm":0,"rental_monthly":0,"comment":""}
+    area_m = re.search(r'(\d+[.,]?\d*)\s*(?:м²|кв\.?\s*м)', title, re.IGNORECASE)
+    area = float(area_m.group(1).replace(',','.')) if area_m else 0
+    prices = {
+        "квартира":  {"moskva": 250000, "mo": 120000},
+        "дом":       {"moskva": 150000, "mo": 80000},
+        "коммерция": {"moskva": 300000, "mo": 120000},
+        "земля":     {"moskva": 50000,  "mo": 15000},
+        "авто":      {"moskva": 1,      "mo": 1},
+        "гараж":     {"moskva": 150000, "mo": 80000},
+    }
+    reg = "moskva" if "moskva" in region else "mo"
+    ppm = prices.get(lot_type, {}).get(reg, 100000)
+    market = int(area * ppm) if area > 0 else 0
+    rental_rates = {
+        "квартира":  {"moskva": 1500, "mo": 700},
+        "коммерция": {"moskva": 3000, "mo": 1200},
+        "дом":       {"moskva": 1000, "mo": 500},
+        "гараж":     {"moskva": 500,  "mo": 250},
+    }
+    rental_pm = rental_rates.get(lot_type, {}).get(reg, 0)
+    rental = int(area * rental_pm) if area > 0 and rental_pm > 0 else 0
+    comment = f"Оценка по {area:.0f}м² × {ppm:,}₽/м² в {region_name}" if area > 0 else f"Типичная цена {lot_type} в {region_name}"
+    return {
+        "market_price": market,
+        "price_per_sqm": ppm,
+        "rental_monthly": rental,
+        "comment": comment
+    }
 
 
 async def analyze_lot(lot: dict) -> dict:
@@ -252,6 +239,11 @@ async def analyze_lot(lot: dict) -> dict:
 
 Дай профессиональный инвестиционный анализ.
 ОБЯЗАТЕЛЬНО:
+Если цена на торгах известна и рыночная цена рассчитана — посчитай дисконт и дай конкретный балл:
+- Дисконт 30%+ и чистая юридика = балл 8-9
+- Дисконт 20-30% = балл 7-8
+- Дисконт меньше 20% = балл 5-6
+- Нет данных о цене = балл 6, но всё равно дай рекомендацию
 - total_score от 1 до 10 (не ставь 5 без причины — анализируй реально)
 - action выбери из: ВХОДИТЬ СЕЙЧАС / ЖДАТЬ СНИЖЕНИЯ / ПРОВЕРИТЬ ДОКУМЕНТЫ / ПРОПУСТИТЬ
 - strategy — 2-3 конкретных предложения с цифрами
@@ -286,7 +278,7 @@ async def analyze_lot(lot: dict) -> dict:
                          "Content-Type": "application/json"},
                 json={"model": MODEL,
                       "messages": [{"role":"user","content":prompt}],
-                      "max_tokens": 600, "temperature": 0.7}
+                      "max_tokens": 600, "temperature": 0.6}
             )
             data = resp.json()
             if "choices" in data:
