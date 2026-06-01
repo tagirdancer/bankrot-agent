@@ -245,13 +245,7 @@ async def run(cats=None, include_extra=True, daily=True):
                 an    = await analyze_lot(lot)
                 score = float(an.get("total_score",0))
 
-                if lot.get("is_extra") and score < 9.0:
-                    print(f"доп.регион {score:.1f} — пропущен")
-                    skipped += 1
-                    continue
-
-                if score < MIN_SCORE:
-                    print(f"{cat:12} | {score:.1f} < {MIN_SCORE} — отсеян")
+                if lot.get("is_extra") and score < 7.0:
                     skipped += 1
                     continue
 
@@ -285,15 +279,6 @@ async def run(cats=None, include_extra=True, daily=True):
         go    = sum(sum(1 for _,a in v if a.get("action")=="ВХОДИТЬ СЕЙЧАС")
                     for v in results.values())
         now   = datetime.now().strftime("%d.%m.%Y %H:%M")
-
-        if total == 0:
-            await send([
-                f"🌅 *Дайджест {now}*\n\n"
-                f"😔 Лотов с баллом {MIN_SCORE}+ не найдено сегодня.\n"
-                f"Изучено: {len(all_lots)} лотов | Отсеяно: {skipped}\n\n"
-                f"_Агент продолжает мониторинг. Горячие лоты пришлют сразу._"
-            ])
-            return
 
         await send([
             f"🌅 *Доброе утро! Дайджест {now}*\n\n"
