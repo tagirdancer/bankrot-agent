@@ -148,20 +148,20 @@ def fmt_block(lot, an, i=0) -> str:
     mkt    = f"\n_📊 {an['market_comment']}_" if an.get('market_comment') else ""
     extra  = f"\n{an['extra_checks']}" if an.get('extra_checks') else ""
     check  = f"\n🔎 _{an['what_to_check']}_" if an.get('what_to_check') else ""
-    exit_s = f"\n🚪 Стратегия выхода: {an['exit_strategy']}" if an.get('exit_strategy') else ""
-    encumb = f"\n🔒 {an['encumbrances']}" if an.get('encumbrances') and an['encumbrances'] not in ('нет данных','уточните на сайте') else ""
+    encumb = f"\n🔒 {an['encumbrances']}" if an.get('encumbrances') else ""
+    exit_s = f"\n🚪 Выход: {an['exit_strategy']}" if an.get('exit_strategy') else ""
     region_note = " 🌍" if lot.get("is_extra") else ""
     return (
         f"{medal} *{an.get('score_label','5/10')}*"
-        f" | {an.get('invest_text','📈 средний')}"
-        f" | {an.get('risk_text','🟡 средний')}"
+        f" | {an.get('invest_text','📈 потенциал: средний')}"
+        f" | {an.get('risk_text','🟡 риск: средний')}"
         f"{region_note}\n"
         f"{lot.get('title','')[:65]}\n"
         f"💰 {an.get('price','—')} → рынок {an.get('market_price','—')}{disc_s}"
         f"{mkt}{step}\n"
         f"💧 Ликвидность: {an.get('liquidity_text','—')}\n"
         f"📈 {an.get('roi_text','нет данных')}\n"
-        f"⚖️ Юридика: {an.get('legal_text','—')}"
+        f"⚖️ {an.get('legal_text','—')}"
         f"{encumb}"
         f"{exit_s}"
         f"{extra}\n"
@@ -178,7 +178,7 @@ def build_msgs(cat_key, results) -> list:
     go   = sum(1 for _,a in results if a.get("action")=="ВХОДИТЬ СЕЙЧАС")
     wait = sum(1 for _,a in results if a.get("action")=="ЖДАТЬ СНИЖЕНИЯ")
     header = (
-        f"{cat['icon']} *{cat['label']} — {now}* | Балл {MIN_SCORE}+\n"
+        f"{cat['icon']} *{cat['label']} — {now}*\n"
         f"Лотов: {len(results)} | 🟢 {go} войти | ⏳ {wait} ждать\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
     )
