@@ -27,7 +27,8 @@ MAX_PAGES = 12
 TOP_N     = 15
 
 CATEGORIES = {
-    "квартира":  {"icon":"🏠","label":"Квартиры",                 "default":True},
+    "квартира":    {"icon":"🏠","label":"Квартиры",                 "default":True},
+    "апартаменты": {"icon":"🏙️","label":"Апартаменты",              "default":True},
     "дом":       {"icon":"🏡","label":"Дома и дачи",              "default":True},
     "коммерция": {"icon":"🏢","label":"Коммерческая недвижимость","default":True},
     "земля":     {"icon":"🌱","label":"Земельные участки",        "default":True},
@@ -144,7 +145,9 @@ def fmt_block(lot, an, i=0) -> str:
     medal  = medals[i] if i < len(medals) else f"#{i+1}"
     disc   = an.get('discount_pct','0')
     disc_s = f" | -{disc}%" if disc not in ('0','?','') else ""
-    step   = f"\n📊 {an['step']}" if an.get('step') else ""
+    step    = f"\n📊 {an['step']}" if an.get('step') else ""
+    urgency = f"\n{an['urgency']}" if an.get('urgency') else ""
+    urgency = f"\n{an['urgency']}" if an.get('urgency') else ""
     mkt    = f"\n_📊 {an['market_comment']}_" if an.get('market_comment') else ""
     extra  = f"\n{an['extra_checks']}" if an.get('extra_checks') else ""
     check  = f"\n🔎 _{an['what_to_check']}_" if an.get('what_to_check') else ""
@@ -160,7 +163,7 @@ def fmt_block(lot, an, i=0) -> str:
         f"{region_note}\n"
         f"{lot.get('title','')[:65]}\n"
         f"💰 {an.get('price','—')} → рынок {an.get('market_price','—')}{disc_s}"
-        f"{mkt}{step}\n"
+        f"{mkt}{step}{urgency}\n"
         f"💧 Ликвидность: {an.get('liquidity_text','—')}\n"
         f"📈 {an.get('roi_text','нет данных')}\n"
         f"⚖️ {an.get('legal_text','—')}"
@@ -185,6 +188,15 @@ def build_msgs(cat_key, results) -> list:
         f"Лотов: {len(results)} | 🟢 {go} войти | ⏳ {wait} ждать\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
     )
+    # Топ-3 лота кратко для быстрого обзора
+    top3 = results[:3]
+    quick_view = "📌 *Топ лоты:*\n"
+    for j,(l,a) in enumerate(top3):
+        disc = a.get('discount_pct','0')
+        disc_s = f"-{disc}%" if disc not in ('0','?') else ""
+        quick_view += f"{'🥇🥈🥉'[j]} {l.get('title','')[:40]} | {a.get('price','—')} {disc_s} | {a.get('action_emoji','⚠️')} {a.get('action','?')}\n"
+    quick_view += "\n"
+    header = header + quick_view
     parts, current = [], header
     for i,(lot,an) in enumerate(results[:TOP_N]):
         block = fmt_block(lot, an, i)
