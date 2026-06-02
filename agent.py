@@ -151,6 +151,7 @@ def fmt_block(lot, an, i=0) -> str:
     encumb = f"\n🔒 {an['encumbrances']}" if an.get('encumbrances') else ""
     exit_s = f"\n🚪 Выход: {an['exit_strategy']}" if an.get('exit_strategy') else ""
     pdf_ok = "\n📄 _Документы проверены_" if an.get('has_pdf') else ""
+    simple = f"\n\n🎯 *{an['verdict_simple']}*" if an.get('verdict_simple') else ""
     region_note = " 🌍" if lot.get("is_extra") else ""
     return (
         f"{medal} *{an.get('score_label','5/10')}*"
@@ -168,6 +169,7 @@ def fmt_block(lot, an, i=0) -> str:
         f"{extra}\n"
         f"{an.get('action_emoji','⚠️')} *{an.get('action','?')}*\n"
         f"💡 _{an.get('strategy','')}_"
+        f"{simple}"
         f"{check}\n"
         f"🔗 {lot.get('url','')}\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
