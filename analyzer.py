@@ -399,22 +399,37 @@ async def analyze_lot(lot: dict) -> dict:
     opps  = expert.get("invest_opportunities",[]) or []
 
     extra = []
-    if disc_pct >= 60: extra.append(f"⚠️ Дисконт {disc_pct}% — проверьте причину низкой цены!")
-    elif disc_pct >= 40: extra.append(f"💡 Дисконт {disc_pct}% — выгодно при чистых документах")
+    if disc_pct >= 60:
+        extra.append(f"⚠️ Дисконт {disc_pct}% — проверьте причину низкой цены!")
+    elif disc_pct >= 40:
+        extra.append(f"💡 Дисконт {disc_pct}% — выгодно при чистых документах")
     if cadastral:
         cad_line = f"🏛 Кадастр: {cadastral}"
-        if rosreestr: cad_line += f"\n   {rosreestr}"
+        if rosreestr:
+            cad_line += f"\n   📍 {rosreestr}"
         extra.append(cad_line)
-    if vin: extra.append(f"🔍 VIN: {vin}")
-    if has_pdf: extra.append("📄 ЕГРН документы скачаны и проверены")
-    if parts_n == 0:   extra.append("👥 Нет заявок — взять по минимуму")
-    elif parts_n <= 2: extra.append(f"👥 {parts_n} участника — конкуренция низкая")
-    elif parts_n > 5:  extra.append(f"👥 ⚠️ {parts_n} участников — высокая конкуренция!")
-    else:              extra.append(f"👥 {parts_n} участника")
-    if risks and risks[0] not in ("нет данных","документы не получены"):
-        extra.append("⚠️ Риски: " + " | ".join(str(r) for r in risks[:2]))
-    if opps and opps[0] not in ("требует анализа",):
-        extra.append("✨ Плюсы: " + " | ".join(str(o) for o in opps[:2]))
+    if vin: extra.append(f"🔍 VIN: {vin} — проверьте на гибдд.рф")
+    if has_pdf:
+        extra.append("📄 ЕГРН документы скачаны и проверены")
+    if parts_n == 0:
+        extra.append("👥 Нет заявок — можно взять по стартовой цене")
+    elif parts_n == 1:
+        extra.append(f"👥 1 участник — конкуренция низкая")
+    elif parts_n <= 3:
+        extra.append(f"👥 {parts_n} участника — умеренная конкуренция")
+    elif parts_n > 5:
+        extra.append(f"👥 ⚠️ {parts_n} участников — высокая конкуренция!")
+    valid_risks = [r for r in risks if r not in
+                   ("нет данных","документы не получены — проверьте перед покупкой",
+                    "требует проверки","стандартные риски")]
+    valid_opps  = [o for o in opps if o not in ("требует анализа",)]
+    if valid_risks:
+        extra.append("⚠️ Риски: " + " | ".join(str(r) for r in valid_risks[:2]))
+    if valid_opps:
+        extra.append("✨ Плюсы: " + " | ".join(str(o) for o in valid_opps[:2]))
+    verdict_simple = expert.get("verdict_simple","")
+    if verdict_simple:
+        extra.append(f"🎯 {verdict_simple}")
     encumb = expert.get("encumbrances","") or ""
     exit_s = expert.get("exit_strategy","") or ""
 
@@ -442,5 +457,6 @@ async def analyze_lot(lot: dict) -> dict:
         "action_emoji":   action_map.get(action,"⚠️"),
         "verdict":        expert.get("verdict",action),
         "has_pdf":        has_pdf,
+        "verdict_simple": expert.get("verdict_simple",""),
         "worth_showing":  True,
     }
