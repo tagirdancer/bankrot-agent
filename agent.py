@@ -147,7 +147,6 @@ def fmt_block(lot, an, i=0) -> str:
     disc_s = f" | -{disc}%" if disc not in ('0','?','') else ""
     step    = f"\n📊 {an['step']}" if an.get('step') else ""
     urgency = f"\n{an['urgency']}" if an.get('urgency') else ""
-    urgency = f"\n{an['urgency']}" if an.get('urgency') else ""
     mkt    = f"\n_📊 {an['market_comment']}_" if an.get('market_comment') else ""
     extra  = f"\n{an['extra_checks']}" if an.get('extra_checks') else ""
     check  = f"\n🔎 _{an['what_to_check']}_" if an.get('what_to_check') else ""
