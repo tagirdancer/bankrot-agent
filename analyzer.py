@@ -28,7 +28,8 @@ def detect_type(text: str) -> str:
     if any(w in t for w in ["гараж","машиноместо","парковочн"]): return "гараж"
     if any(w in t for w in ["земельн","участок"," га ","гектар","снт ","ижс","лпх "]):
         if not any(w in t for w in ["квартир","комнат","студи"]): return "земля"
-    if any(w in t for w in ["квартир","комнат","студи","апартамент",
+    if any(w in t for w in ["апартамент"]): return "апартаменты"
+    if any(w in t for w in ["квартир","комнат","студи",
                              "однокомнат","двухкомнат","жилое помещение"]): return "квартира"
     if any(w in t for w in ["жилой дом","дача","коттедж","таунхаус",
                              "садовый дом","домовлад"]): return "дом"
@@ -269,7 +270,7 @@ async def get_expert_analysis(title, lot_type, region_name, lot_price,
   "liquidity_days": 45,
   "exit_strategy": "перепродажа за 30-60 дней / сдача в аренду X₽/мес",
   "strategy": "Конкретно: почему входить или нет. Ключевые цифры.",
-  "what_to_check": "1. выписка ЕГРН 2. долги ЖКХ 3. прописанные лица",
+  "what_to_check": "КОНКРЕТНО для {lot_type}: укажи 3-5 пунктов специфичных для этого объекта и его ситуации",
   "action": "ВХОДИТЬ СЕЙЧАС",
   "verdict": "РЕКОМЕНДУЕТСЯ К ПОКУПКЕ"
 }}
@@ -361,6 +362,15 @@ async def analyze_lot(lot: dict) -> dict:
     score     = calc_score(lot_price, mkt_prc, rental, parts_n,
                            cadastral, step_cur, step_tot, has_pdf)
     step_info = f"Шаг {step_cur}/{step_tot} (осталось {step_tot-step_cur})" if step_cur else ""
+    urgency = ""
+    if step_cur and step_tot:
+        left = step_tot - step_cur
+        if left == 0:
+            urgency = "🚨 ПОСЛЕДНИЙ ШАГ — торги закрываются!"
+        elif left == 1:
+            urgency = "⏰ Предпоследний шаг — цена не снизится"
+        elif left <= 3:
+            urgency = f"⏳ Осталось {left} снижения цены"
     full_text = pdf_text or page_text[:1000]
     expert    = await get_expert_analysis(
         title, lot_type, rname, lot_price, mkt_prc,
@@ -390,8 +400,15 @@ async def analyze_lot(lot: dict) -> dict:
     invest_icons = {"высокий":"🔥","средний":"📈","низкий":"📉"}
     risk_icons   = {"низкий":"🟢","средний":"🟡","высокий":"🟠","критический":"🔴"}
     ip = expert.get("invest_potential","средний") or "средний"
-    rl = expert.get("risk_level","средний") or "средний"
-    if disc_pct >= 50 and not has_pdf and rl == "средний": rl = "высокий"
+    rl_raw = expert.get("risk_level","средний") or "средний"
+    if disc_pct >= 60 and not has_pdf:
+        rl = "высокий"
+    elif disc_pct >= 40 and not has_pdf and rl_raw == "низкий":
+        rl = "средний"
+    elif disc_pct >= 60 and has_pdf and rl_raw in ("средний","высокий"):
+        rl = "средний"
+    else:
+        rl = rl_raw
     action = expert.get("action",
                         "ВХОДИТЬ СЕЙЧАС" if score>=8 else
                         "ЖДАТЬ СНИЖЕНИЯ" if score>=7 else "ПРОВЕРИТЬ ДОКУМЕНТЫ")
@@ -410,7 +427,7 @@ async def analyze_lot(lot: dict) -> dict:
         extra.append(cad_line)
     if vin: extra.append(f"🔍 VIN: {vin} — проверьте на гибдд.рф")
     if has_pdf:
-        extra.append("📄 ЕГРН документы скачаны и проверены")
+        pass  # статус PDF отражён в legal_text
     if parts_n == 0:
         extra.append("👥 Нет заявок — можно взять по стартовой цене")
     elif parts_n == 1:
@@ -444,7 +461,7 @@ async def analyze_lot(lot: dict) -> dict:
         "step":           step_info,
         "liquidity_text": f"{expert.get('liquidity_level','средняя')} (~{expert.get('liquidity_days',90)} дней)",
         "roi_text":       roi_text,
-        "legal_text":     expert.get("legal_summary","требует проверки"),
+        "legal_text":     expert.get("legal_summary","требует проверки") + (" ✅ PDF проверен" if has_pdf else " ⚠️ документы не получены"),
         "encumbrances":   encumb if encumb not in ("уточните на сайте","") else "",
         "owners":         expert.get("owners_count","?"),
         "exit_strategy":  exit_s if exit_s not in ("уточните после проверки документов","") else "",
@@ -457,6 +474,7 @@ async def analyze_lot(lot: dict) -> dict:
         "action_emoji":   action_map.get(action,"⚠️"),
         "verdict":        expert.get("verdict",action),
         "has_pdf":        has_pdf,
+        "urgency":        urgency,
         "verdict_simple": expert.get("verdict_simple",""),
         "worth_showing":  True,
     }
