@@ -1,3 +1,4 @@
+# v2.0 — Bankrot Bot with regions
 import asyncio, os, re
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
