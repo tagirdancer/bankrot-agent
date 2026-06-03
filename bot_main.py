@@ -69,7 +69,7 @@ async def trigger_workflow(category: str = "все", region: str = "moskva") -> 
             resp = await client.post(
                 "https://api.github.com/repos/tagirdancer/bankrot-agent/actions/workflows/agent.yml/dispatches",
                 headers={
-                    "Authorization": f"Bearer {GH_TOKEN}",
+                    "Authorization": f"token {GH_TOKEN}",
                     "Accept": "application/vnd.github.v3+json",
                 },
                 json={"ref": "main", "inputs": {"category": category}}
