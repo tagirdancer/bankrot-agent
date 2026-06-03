@@ -119,8 +119,8 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             )
         else:
             await q.edit_message_text(
-                f"⚠️ *Для запуска нужен GITHUB\_TOKEN*\n\n"
-                f"Добавьте GITHUB\_TOKEN в переменные Railway\n"
+                f"⚠️ *Для запуска нужен GITHUB TOKEN*\n\n"
+                f"Добавьте GITHUB TOKEN в переменные Railway\n"
                 f"или запустите вручную:\ngithub.com/tagirdancer/bankrot-agent/actions",
                 parse_mode="Markdown",
                 reply_markup=InlineKeyboardMarkup([[
