@@ -84,7 +84,7 @@ async def ask_expert(question: str) -> str:
         async with httpx.AsyncClient(timeout=30) as client:
             resp = await client.post(
                 GROQ_URL,
-                headers={"Authorization": f"Bearer {GROQ_KEY}",
+                headers={"Authorization": f"token {GROQ_KEY}",
                          "Content-Type": "application/json"},
                 json={
                     "model": "llama-3.1-8b-instant",
