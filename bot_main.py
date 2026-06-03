@@ -62,20 +62,25 @@ def regions_menu():
 
 async def trigger_workflow(category: str = "все", region: str = "moskva") -> bool:
     import httpx
-    if not GH_TOKEN:
+    token = os.getenv("GITHUB_TOKEN", "")
+    if not token:
+        print("GITHUB_TOKEN not found in environment")
         return False
     try:
         async with httpx.AsyncClient(timeout=15) as client:
             resp = await client.post(
                 "https://api.github.com/repos/tagirdancer/bankrot-agent/actions/workflows/agent.yml/dispatches",
                 headers={
-                    "Authorization": f"token {GH_TOKEN}",
+                    "Authorization": f"token {token}",
                     "Accept": "application/vnd.github.v3+json",
+                    "X-GitHub-Api-Version": "2022-11-28",
                 },
                 json={"ref": "main", "inputs": {"category": category}}
             )
+            print(f"GitHub API status: {resp.status_code}")
             return resp.status_code == 204
-    except:
+    except Exception as e:
+        print(f"GitHub API error: {e}")
         return False
 
 async def ask_expert(question: str) -> str:
