@@ -190,6 +190,11 @@ def calc_market_price(lot_type: str, title: str, region: str) -> dict:
     ppm    = prices.get(lot_type, {}).get(reg, 100000)
     rpm    = rentals.get(lot_type, {}).get(reg, 0)
     market = int(area * ppm) if area > 0 else 0
+    # Защита от абсурдных оценок
+    if lot_type == "земля" and market > 30_000_000:
+        market = 0  # земля редко стоит больше 30 млн — вероятно ошибка площади
+    if market > 0 and area > 10000:  # площадь больше 10000 м² подозрительна
+        market = 0
     rental = int(area * rpm) if area > 0 and rpm > 0 else 0
     return {
         "market_price": market, "rental_monthly": rental,
@@ -359,6 +364,10 @@ async def analyze_lot(lot: dict) -> dict:
     disc_pct = 0
     if mkt_prc > 0 and lot_price > 0 and mkt_prc > lot_price:
         disc_pct = round((mkt_prc - lot_price) / mkt_prc * 100)
+        # Дисконт выше 85% почти всегда ошибка оценки — не доверяем
+        if disc_pct >= 85:
+            disc_pct = 0
+            mkt_prc = 0  # сбрасываем недостоверную рыночную цену
     has_pdf   = len(pdf_text) > 100
     score     = calc_score(lot_price, mkt_prc, rental, parts_n,
                            cadastral, step_cur, step_tot, has_pdf)
