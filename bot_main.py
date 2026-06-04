@@ -105,6 +105,68 @@ async def ask_expert(question: str) -> str:
         return f"Ошибка: {e}"
     return "Нет ответа"
 
+
+async def deep_analysis(lot_id: str) -> str:
+    import httpx
+    url = f"https://tbankrot.ru/item?id={lot_id}"
+    prompt = f"""Ты эксперт по инвестициям в банкротную недвижимость России
+с 15-летним опытом. Проведи ПОЛНЫЙ профессиональный анализ лота.
+
+Лот: {url}
+
+Дай развёрнутый разбор как для серьёзного инвестора. Структура ответа:
+
+🏛 ЮРИДИЧЕСКАЯ ЧИСТОТА
+- Сколько собственников, есть ли доли
+- Обременения: ипотека, арест, залог
+- Прописанные лица, несовершеннолетние
+- Риск оспаривания сделки
+
+💰 ФИНАНСОВЫЙ АНАЛИЗ
+- Реальная рыночная цена для этого района
+- Дисконт и насколько он оправдан
+- Скрытые расходы: долги ЖКХ, налоги, оформление
+
+📊 КАК ЗАРАБОТАТЬ (3 стратегии с цифрами)
+- Флип (быстрая перепродажа): срок, прибыль, риски
+- Аренда: ставка, доходность %, окупаемость
+- Долгосрочное владение: перспектива района
+
+⏰ ТАКТИКА ТОРГОВ
+- Заходить сейчас или ждать снижения цены
+- На каком шаге оптимально подавать заявку
+- Сколько конкурентов и как это влияет на стратегию
+
+⚠️ ГЛАВНЫЕ РИСКИ
+- Топ-3 риска именно этого объекта
+- Как их проверить и закрыть
+
+🎯 ВЕРДИКТ ЭКСПЕРТА
+Одно чёткое предложение: БРАТЬ или НЕ БРАТЬ и почему,
+с конкретной максимальной ценой до которой стоит торговаться.
+
+Пиши конкретно, с цифрами, как опытный инвестор. Без воды."""
+
+    try:
+        async with httpx.AsyncClient(timeout=60) as client:
+            resp = await client.post(
+                GROQ_URL,
+                headers={"Authorization": f"Bearer {GROQ_KEY}",
+                         "Content-Type": "application/json"},
+                json={
+                    "model": "llama-3.1-8b-instant",
+                    "messages": [{"role": "user", "content": prompt}],
+                    "max_tokens": 1500,
+                    "temperature": 0.6,
+                }
+            )
+            data = resp.json()
+            if "choices" in data:
+                return data["choices"][0]["message"]["content"]
+    except Exception as e:
+        return f"Ошибка анализа: {e}"
+    return "Не удалось получить анализ. Попробуйте позже."
+
 # Хранилище выбранного региона
 user_region = {}
 
@@ -122,8 +184,17 @@ async def cmd_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q    = update.callback_query
-    await q.answer()
     data = q.data
+
+    if data.startswith("deep_"):
+        lot_id = data.replace("deep_", "")
+        await q.answer("Анализирую...")
+        await q.message.reply_text("🔍 Готовлю полный экспертный анализ, подождите ~30 секунд...")
+        analysis = await deep_analysis(lot_id)
+        await q.message.reply_text(analysis, parse_mode="Markdown")
+        return
+
+    await q.answer()
     chat = str(q.message.chat_id)
 
     if data == "back_menu":
