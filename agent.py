@@ -11,6 +11,7 @@ from datetime import datetime
 from dotenv import load_dotenv
 from playwright.async_api import async_playwright
 import telegram
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from analyzer import analyze_lot, detect_type, get_lot_details, MIN_SCORE
 
 load_dotenv()
@@ -207,13 +208,14 @@ def build_msgs(cat_key, results) -> list:
     return parts
 
 
-async def send(msgs):
+async def send(msgs, reply_markup=None):
     bot = telegram.Bot(token=TG_TOKEN)
     for msg in msgs:
         try:
             await bot.send_message(
                 chat_id=TG_CHAT, text=msg,
-                parse_mode="Markdown", disable_web_page_preview=True
+                parse_mode="Markdown", disable_web_page_preview=True,
+                reply_markup=reply_markup
             )
             await asyncio.sleep(1)
         except Exception as e:
@@ -275,6 +277,12 @@ async def run(cats=None, include_extra=True, daily=True):
                 if score >= 9.0:
                     disc = an.get("discount_pct","?")
                     rn   = f"\n🌍 Регион: {lot.get('region','')}" if lot.get("is_extra") else ""
+                    url  = lot.get("url","")
+                    m    = re.search(r'id=(\d+)', url)
+                    lot_id = lot.get("id") or (m.group(1) if m else "")
+                    kb = InlineKeyboardMarkup([[
+                        InlineKeyboardButton("🔍 Полный анализ", callback_data=f"deep_{lot_id}")
+                    ]])
                     await send([
                         f"🔔 *ГОРЯЧИЙ ЛОТ! Балл {score}/10*{rn}\n\n"
                         f"{lot.get('title','')[:70]}\n"
@@ -283,7 +291,7 @@ async def run(cats=None, include_extra=True, daily=True):
                         f"{an.get('action_emoji','⚠️')} *{an.get('action','?')}*\n"
                         f"💡 _{an.get('strategy','')}_ \n\n"
                         f"🔗 {lot.get('url','')}"
-                    ])
+                    ], reply_markup=kb)
                     alerts += 1
 
             except Exception as e:
