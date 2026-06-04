@@ -153,7 +153,7 @@ def fmt_block(lot, an, i=0) -> str:
     check  = f"\n🔎 _{an['what_to_check']}_" if an.get('what_to_check') else ""
     encumb = f"\n🔒 {an['encumbrances']}" if an.get('encumbrances') else ""
     exit_s = f"\n🚪 Выход: {an['exit_strategy']}" if an.get('exit_strategy') else ""
-    pdf_ok = "\n📄 _Документы проверены_" if an.get('has_pdf') else ""
+    doc_st = f"\n📄 _{an['document_status']}_" if an.get('document_status') else ""
     simple = f"\n\n🎯 *{an['verdict_simple']}*" if an.get('verdict_simple') else ""
     region_note = " 🌍" if lot.get("is_extra") else ""
     return (
@@ -167,7 +167,7 @@ def fmt_block(lot, an, i=0) -> str:
         f"💧 Ликвидность: {an.get('liquidity_text','—')}\n"
         f"📈 {an.get('roi_text','нет данных')}\n"
         f"⚖️ {an.get('legal_text','—')}"
-        f"{encumb}{pdf_ok}"
+        f"{encumb}{doc_st}"
         f"{exit_s}"
         f"{extra}\n"
         f"{an.get('action_emoji','⚠️')} *{an.get('action','?')}*\n"
@@ -283,13 +283,13 @@ async def run(cats=None, include_extra=True, daily=True):
                     kb = InlineKeyboardMarkup([[
                         InlineKeyboardButton("🔍 Полный анализ", callback_data=f"deep_{lot_id}")
                     ]])
+                    verdict_line = an.get("verdict_simple") or an.get("action", "?")
                     await send([
-                        f"🔔 *ГОРЯЧИЙ ЛОТ! Балл {score}/10*{rn}\n\n"
+                        f"🔔 *ГОРЯЧИЙ ЛОТ — {score}/10*{rn}\n"
                         f"{lot.get('title','')[:70]}\n"
                         f"💰 {an.get('price','—')} → рынок {an.get('market_price','—')}"
                         f"{f' (-{disc}%)' if disc not in ('?','0') else ''}\n"
-                        f"{an.get('action_emoji','⚠️')} *{an.get('action','?')}*\n"
-                        f"💡 _{an.get('strategy','')}_ \n\n"
+                        f"{an.get('action_emoji','⚠️')} *{verdict_line}*\n"
                         f"🔗 {lot.get('url','')}"
                     ], reply_markup=kb)
                     alerts += 1
