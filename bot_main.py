@@ -1,9 +1,13 @@
 # v2.0 — Bankrot Bot with regions
-import asyncio, os, re
+import asyncio, os, re, logging
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
 from dotenv import load_dotenv
 load_dotenv()
+
+logging.basicConfig(level=logging.INFO,
+                    format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger("bot_main")
 
 TG_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TG_CHAT  = os.getenv("TELEGRAM_CHAT_ID")
@@ -108,6 +112,10 @@ async def ask_expert(question: str) -> str:
 
 async def deep_analysis(lot_id: str) -> str:
     import httpx
+    if not GROQ_KEY:
+        log.error("deep_analysis: GROQ_API_KEY отсутствует в окружении (проверьте Railway -> Variables)")
+        return ("\u26a0\ufe0f На сервере не настроен ключ GROQ_API_KEY.\n"
+                "Добавьте переменную GROQ_API_KEY в Railway -> сервис web -> Variables.")
     url = f"https://tbankrot.ru/item?id={lot_id}"
     prompt = f"""Ты эксперт по инвестициям в банкротную недвижимость России
 с 15-летним опытом. Проведи ПОЛНЫЙ профессиональный анализ лота.
@@ -148,7 +156,7 @@ async def deep_analysis(lot_id: str) -> str:
 Пиши конкретно, с цифрами, как опытный инвестор. Без воды."""
 
     try:
-        async with httpx.AsyncClient(timeout=60) as client:
+        async with httpx.AsyncClient(timeout=90) as client:
             resp = await client.post(
                 GROQ_URL,
                 headers={"Authorization": f"Bearer {GROQ_KEY}",
@@ -160,11 +168,19 @@ async def deep_analysis(lot_id: str) -> str:
                     "temperature": 0.6,
                 }
             )
+            if resp.status_code != 200:
+                log.error("deep_analysis: Groq статус %s, тело: %s",
+                          resp.status_code, resp.text[:500])
+                return (f"\u26a0\ufe0f Анализ временно недоступен (Groq ответил {resp.status_code}).\n"
+                        f"Причина записана в логи Railway. Попробуйте позже.")
             data = resp.json()
-            if "choices" in data:
-                return data["choices"][0]["message"]["content"]
-    except Exception as e:
-        return f"Ошибка анализа: {e}"
+            choices = data.get("choices")
+            if choices:
+                return choices[0]["message"]["content"]
+            log.error("deep_analysis: в ответе Groq нет choices: %s", str(data)[:500])
+    except Exception:
+        log.exception("full_analysis failed: ошибка запроса к Groq")
+        return "\u26a0\ufe0f Не удалось получить анализ (ошибка запроса). Подробности в логах Railway."
     return "Не удалось получить анализ. Попробуйте позже."
 
 # Хранилище выбранного региона
@@ -188,10 +204,18 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if data.startswith("deep_"):
         lot_id = data.replace("deep_", "")
-        await q.answer("Анализирую...")
-        await q.message.reply_text("🔍 Готовлю полный экспертный анализ, подождите ~30 секунд...")
-        analysis = await deep_analysis(lot_id)
-        await q.message.reply_text(analysis, parse_mode="Markdown")
+        try:
+            await q.answer("Анализирую...")
+            await q.message.reply_text("🔍 Готовлю полный экспертный анализ, подождите ~30 секунд...")
+            analysis = await deep_analysis(lot_id)
+            try:
+                await q.message.reply_text(analysis, parse_mode="Markdown")
+            except Exception:
+                log.exception("full_analysis failed: ошибка отправки с Markdown, шлю без форматирования")
+                await q.message.reply_text(analysis)
+        except Exception:
+            log.exception("full_analysis failed")
+            await q.message.reply_text("\u26a0\ufe0f Не удалось получить анализ (внутренняя ошибка). Подробности в логах Railway.")
         return
 
     await q.answer()
