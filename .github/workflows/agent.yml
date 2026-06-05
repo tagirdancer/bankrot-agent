@@ -1,7 +1,14 @@
 name: Bankrot Agent v9
 
+# Дайджест: только 1 раз в сутки по cron (08:00 МСК).
+# Дополнительные запуски — только вручную (workflow_dispatch) или кнопкой бота.
+concurrency:
+  group: bankrot-agent-digest
+  cancel-in-progress: true
+
 on:
   schedule:
+    # 08:00 МСК (UTC+3) = 05:00 UTC — один автоматический запуск в сутки
     - cron: '0 5 * * *'
   workflow_dispatch:
     inputs:
