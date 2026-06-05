@@ -281,7 +281,7 @@ async def run(cats=None, include_extra=True, daily=True):
                     m    = re.search(r'id=(\d+)', url)
                     lot_id = lot.get("id") or (m.group(1) if m else "")
                     kb = InlineKeyboardMarkup([[
-                        InlineKeyboardButton("🔍 Полный анализ", callback_data=f"deep_{lot_id}")
+                        InlineKeyboardButton("🔍 Полный анализ", callback_data=f"deep_{lot_id}_{int(an.get('lot_price_raw',0) or 0)}_{int(an.get('market_price_raw',0) or 0)}_{an.get('discount_pct','0')}_{lot.get('participants',0)}")
                     ]])
                     verdict_line = an.get("verdict_simple") or an.get("action", "?")
                     await send([
