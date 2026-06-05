@@ -529,6 +529,8 @@ async def analyze_lot(lot: dict) -> dict:
         "market_price":   fmt(mkt_prc),
         "market_comment": mkt.get("comment",""),
         "discount_pct":   str(disc_pct) if disc_pct > 0 else "0",
+        "lot_price_raw":  lot_price,
+        "market_price_raw": mkt_prc,
         "step":           step_info,
         "liquidity_text": f"{expert.get('liquidity_level','средняя')} (~{expert.get('liquidity_days',90)} дней)",
         "roi_text":       roi_text,
