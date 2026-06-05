@@ -12,7 +12,8 @@ from dotenv import load_dotenv
 from playwright.async_api import async_playwright
 import telegram
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
-from analyzer import analyze_lot, detect_type, get_lot_details, MIN_SCORE
+from analyzer import (analyze_lot, detect_type, get_lot_details, MIN_SCORE,
+                      format_short_lot_message, deep_callback_data)
 
 load_dotenv()
 
@@ -116,7 +117,9 @@ async def enrich(lot, page, ctx):
         "participants": details.get("participants",0),
         "vin":          details.get("vin",""),
         "cadastral":    details.get("cadastral",""),
+        "address":      details.get("address",""),
     })
+    lot["parsed_at"] = datetime.now().isoformat()
     if details.get("title_full"):
         lot["title"] = details["title_full"]
     lot["category"] = detect_type(
@@ -275,23 +278,14 @@ async def run(cats=None, include_extra=True, daily=True):
                 print(f"{cat:12} | ⭐{score:.1f} | {an.get('action','?')} {extra_note}")
 
                 if score >= 9.0:
-                    disc = an.get("discount_pct","?")
-                    rn   = f"\n🌍 Регион: {lot.get('region','')}" if lot.get("is_extra") else ""
                     url  = lot.get("url","")
                     m    = re.search(r'id=(\d+)', url)
                     lot_id = lot.get("id") or (m.group(1) if m else "")
                     kb = InlineKeyboardMarkup([[
-                        InlineKeyboardButton("🔍 Полный анализ", callback_data=f"deep_{lot_id}_{int(an.get('lot_price_raw',0) or 0)}_{int(an.get('market_price_raw',0) or 0)}_{an.get('discount_pct','0')}_{lot.get('participants',0)}")
+                        InlineKeyboardButton("🔍 Полный анализ",
+                            callback_data=deep_callback_data(lot_id, an, lot, lot.get("parsed_at")))
                     ]])
-                    verdict_line = an.get("verdict_simple") or an.get("action", "?")
-                    await send([
-                        f"🔔 *ГОРЯЧИЙ ЛОТ — {score}/10*{rn}\n"
-                        f"{lot.get('title','')[:70]}\n"
-                        f"💰 {an.get('price','—')} → рынок {an.get('market_price','—')}"
-                        f"{f' (-{disc}%)' if disc not in ('?','0') else ''}\n"
-                        f"{an.get('action_emoji','⚠️')} *{verdict_line}*\n"
-                        f"🔗 {lot.get('url','')}"
-                    ], reply_markup=kb)
+                    await send([format_short_lot_message(lot, an, "ГОРЯЧИЙ ЛОТ")], reply_markup=kb)
                     alerts += 1
 
             except Exception as e:
