@@ -1,5 +1,6 @@
 # v2.0 — Bankrot Bot with regions
 import asyncio, os, re, logging
+from datetime import datetime
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
 from dotenv import load_dotenv
@@ -14,6 +15,9 @@ TG_CHAT  = os.getenv("TELEGRAM_CHAT_ID")
 GROQ_KEY = os.getenv("GROQ_API_KEY")
 GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 GH_TOKEN = os.getenv("GITHUB_TOKEN", "")
+
+# Кэш спарсенных лотов (кадастр, адрес, дата) для «Полного анализа»
+lot_cache = {}
 
 # Все регионы Т-Банкрот
 REGIONS = {
@@ -110,8 +114,55 @@ async def ask_expert(question: str) -> str:
     return "Нет ответа"
 
 
+def extract_lot_id(text: str):
+    """Распознаёт id лота из ссылки tbankrot.ru или просто номера."""
+    text = (text or "").strip()
+    m = re.search(r"tbankrot\.ru/item[^\d]*id=(\d+)", text, re.IGNORECASE)
+    if m:
+        return m.group(1)
+    m = re.search(r"\bid=(\d+)", text, re.IGNORECASE)
+    if m:
+        return m.group(1)
+    if re.fullmatch(r"\d{5,10}", text):
+        return text
+    m = re.search(r"(?:лот|торг|id|№)\s*[:#]?\s*(\d{5,10})", text, re.IGNORECASE)
+    if m:
+        return m.group(1)
+    return None
+
+
+async def fetch_and_analyze_lot(lot_id: str):
+    """Парсит и анализирует лот той же логикой, что дайджест (agent.enrich + analyze_lot)."""
+    from playwright.async_api import async_playwright
+    from agent import enrich
+    from analyzer import analyze_lot
+
+    url = f"https://tbankrot.ru/item?id={lot_id}"
+    lot = {
+        "id": lot_id, "title": "", "url": url,
+        "region": "moskva", "pdf_text": "", "description": "",
+        "price": 0, "step_current": 0, "step_total": 0,
+        "participants": 0, "vin": "", "cadastral": "", "address": "",
+        "is_extra": False, "source": "Т-Банкрот",
+    }
+    parsed_at = datetime.now()
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True)
+        ctx = await browser.new_context(user_agent=(
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36"
+        ))
+        page = await ctx.new_page()
+        await enrich(lot, page, ctx)
+        await browser.close()
+    an = await analyze_lot(lot)
+    lot["parsed_at"] = parsed_at.isoformat()
+    return lot, an, parsed_at
+
+
 async def deep_analysis(lot_id: str, facts: dict = None) -> str:
     import httpx
+    from analyzer import build_verification_links
     facts = facts or {}
     if not GROQ_KEY:
         log.error("deep_analysis: GROQ_API_KEY отсутствует в окружении (проверьте Railway -> Variables)")
@@ -147,6 +198,29 @@ async def deep_analysis(lot_id: str, facts: dict = None) -> str:
         known.append(f"Количество заявок: {parts}")
     else:
         known.append("Количество заявок: НЕТ ДАННЫХ")
+
+    cadastral = facts.get("cadastral", "")
+    address = facts.get("address", "")
+    if cadastral:
+        known.append(f"Кадастровый номер: {cadastral}")
+    else:
+        known.append("Кадастровый номер: не найден в карточке")
+    if address:
+        known.append(f"Адрес: {address}")
+
+    parsed_hdr = ""
+    pts = facts.get("parsed_at")
+    if pts:
+        try:
+            if isinstance(pts, int):
+                parsed_hdr = datetime.fromtimestamp(pts).strftime("%d.%m.%Y %H:%M")
+            else:
+                parsed_hdr = datetime.fromisoformat(str(pts)).strftime("%d.%m.%Y %H:%M")
+            known.append(f"Дата спарсинга данных: {parsed_hdr}")
+        except Exception:
+            pass
+
+    verify_links = build_verification_links(cadastral, address)
     known_block = "\n".join("- " + k for k in known)
 
     prompt = f"""Ты помогаешь инвестору проверить лот с банкротных торгов в России.
@@ -170,11 +244,12 @@ async def deep_analysis(lot_id: str, facts: dict = None) -> str:
 - только факты из «ИЗВЕСТНЫЕ ДАННЫЕ», без додумывания.
 
 🔎 ЧТО ОБЯЗАТЕЛЬНО ПРОВЕРИТЬ САМОМУ (И ГДЕ)
-- обременения, аресты, залоги — ЕГРН (Росреестр) и банк данных ФССП по адресу/кадастру;
+Используй ТОЛЬКО эти прямые ссылки (не придумывай другие URL):
+{verify_links}
 - долги ЖКХ и капремонт — в управляющей компании / по квитанциям;
 - прописанные лица — выписка из домовой книги;
 - условия торгов, задаток, шаг цены, дедлайн — карточка лота на площадке.
-Для каждого пункта укажи, ГДЕ это проверить.
+Для каждого пункта укажи, ГДЕ это проверить. Если кадастрового номера нет — так и напиши.
 
 ❓ ВОПРОСЫ К ОБЪЕКТУ
 - что спросить у организатора торгов и на что обратить внимание.
@@ -206,7 +281,10 @@ async def deep_analysis(lot_id: str, facts: dict = None) -> str:
             data = resp.json()
             choices = data.get("choices")
             if choices:
-                return choices[0]["message"]["content"]
+                body = choices[0]["message"]["content"]
+                if parsed_hdr:
+                    body = f"📅 Данные спарсены: {parsed_hdr}\n\n{body}"
+                return body
             log.error("deep_analysis: в ответе Groq нет choices: %s", str(data)[:500])
     except Exception:
         log.exception("full_analysis failed: ошибка запроса к Groq")
@@ -240,6 +318,18 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if len(bits) >= 5:
             facts = {"price_raw": bits[1], "market_raw": bits[2],
                      "disc": bits[3], "parts": bits[4]}
+        if len(bits) >= 6:
+            try:
+                facts["parsed_at"] = int(bits[5])
+            except ValueError:
+                pass
+        cached = lot_cache.get(lot_id, {})
+        if cached.get("cadastral"):
+            facts["cadastral"] = cached["cadastral"]
+        if cached.get("address"):
+            facts["address"] = cached["address"]
+        if cached.get("parsed_at") and "parsed_at" not in facts:
+            facts["parsed_at"] = cached["parsed_at"]
         try:
             await q.answer("Анализирую...")
             await q.message.reply_text("🔍 Готовлю чек-лист проверки лота, подождите ~30 секунд...")
@@ -351,17 +441,47 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     text = update.message.text or ""
-    if "tbankrot.ru/item" in text or re.search(r'id=\d+', text):
-        await update.message.reply_text("⏳ Анализирую лот...")
-        url_m = re.search(r'https?://\S+', text)
-        url = url_m.group() if url_m else ""
-        if not url:
-            id_m = re.search(r'id=(\d+)', text)
-            url = f"https://tbankrot.ru/item?id={id_m.group(1)}" if id_m else ""
-        if url:
-            answer = await ask_expert(f"Проанализируй лот: {url}\nДай оценку: риски, что проверить.")
-            await update.message.reply_text(answer, reply_markup=main_menu())
+    lot_id = extract_lot_id(text)
+    if lot_id:
+        from analyzer import format_short_lot_message, deep_callback_data
+        msg = await update.message.reply_text("⏳ Парсю и анализирую лот (~1 мин)...")
+        try:
+            lot, an, parsed_at = await fetch_and_analyze_lot(lot_id)
+            lot_cache[lot_id] = {
+                "cadastral": lot.get("cadastral", ""),
+                "address": lot.get("address", ""),
+                "parsed_at": int(parsed_at.timestamp()),
+            }
+            kb = InlineKeyboardMarkup([[
+                InlineKeyboardButton("🔍 Полный анализ",
+                    callback_data=deep_callback_data(lot_id, an, lot, parsed_at))
+            ]])
+            await msg.edit_text(
+                format_short_lot_message(lot, an),
+                parse_mode="Markdown",
+                reply_markup=kb,
+                disable_web_page_preview=True,
+            )
+        except Exception:
+            log.exception("link_analysis failed for lot %s", lot_id)
+            await msg.edit_text(
+                f"⚠️ Не удалось спарсить лот *{lot_id}*.\n\n"
+                f"Проверьте ссылку или попробуйте позже.\n"
+                f"Подробности записаны в логи Railway.",
+                parse_mode="Markdown",
+            )
         return
+
+    if re.search(r"tbankrot|банкрот|лот|id\s*=", text, re.IGNORECASE):
+        await update.message.reply_text(
+            "Не распознал лот. Пришлите:\n"
+            "• ссылку: `https://tbankrot.ru/item?id=7629977`\n"
+            "• или номер лота: `7629977`",
+            parse_mode="Markdown",
+            reply_markup=main_menu(),
+        )
+        return
+
     if len(text) > 3:
         msg = await update.message.reply_text("💭 Думаю...")
         answer = await ask_expert(text)
