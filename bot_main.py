@@ -520,7 +520,7 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"🚀 *Анализ запущен!*\n\n"
             f"📂 Категория: *{label}*\n"
             f"📍 Регион: *{region_name}*\n\n"
-            f"⚡ Лоты ≥8 баллов — *сразу*, по мере просмотра (~2–5 мин)\n"
+            f"⚡ Горячие лоты (дисконт ≥30%) — по мере тяжёлого анализа\n"
             f"📦 Полный дайджест — в конце (~30–45 мин)\n"
             f"📋 /latest — не ждать, открыть прошлый снимок",
             parse_mode="Markdown",
