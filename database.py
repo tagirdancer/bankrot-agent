@@ -1,10 +1,9 @@
 """
-База данных — история лотов, портфель, статистика
+SQLite-хранилище: сохранённые лоты, история дайджеста, напоминания.
+Надёжнее json на Railway (один файл, атомарные записи).
 """
-import sqlite3
-import json
-import os
-from datetime import datetime
+import os, sqlite3, json
+from datetime import datetime, timedelta
 
 DB_PATH = os.path.join(os.path.dirname(__file__), "bankrot.db")
 
@@ -16,247 +15,125 @@ def get_conn():
 
 
 def init_db():
-    """Создаёт таблицы если не существуют"""
     conn = get_conn()
     conn.executescript("""
-    CREATE TABLE IF NOT EXISTS lots (
-        id TEXT PRIMARY KEY,
+    CREATE TABLE IF NOT EXISTS saved_lots (
+        lot_id TEXT NOT NULL,
+        chat_id TEXT NOT NULL,
         title TEXT,
         url TEXT,
-        category TEXT,
-        region TEXT,
-        first_seen TEXT,
-        last_seen TEXT
-    );
-
-    CREATE TABLE IF NOT EXISTS lot_prices (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        lot_id TEXT,
         price REAL,
-        step_current INTEGER,
-        step_total INTEGER,
-        score REAL,
-        action TEXT,
-        recorded_at TEXT,
-        FOREIGN KEY(lot_id) REFERENCES lots(id)
+        deadline TEXT,
+        lot_json TEXT,
+        saved_at TEXT,
+        reminded INTEGER DEFAULT 0,
+        PRIMARY KEY (lot_id, chat_id)
     );
-
-    CREATE TABLE IF NOT EXISTS notifications (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        lot_id TEXT,
-        sent_at TEXT,
-        score REAL,
-        action TEXT
-    );
-
-    CREATE TABLE IF NOT EXISTS portfolio (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        lot_id TEXT,
-        title TEXT,
-        url TEXT,
-        category TEXT,
-        buy_price REAL,
-        market_price REAL,
-        status TEXT DEFAULT 'watching',
-        added_at TEXT,
-        notes TEXT
-    );
-
-    CREATE TABLE IF NOT EXISTS stats (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        date TEXT,
-        lots_analyzed INTEGER,
-        lots_recommended INTEGER,
-        lots_go INTEGER,
-        lots_wait INTEGER,
-        categories TEXT
+    CREATE TABLE IF NOT EXISTS digest_history (
+        lot_id TEXT PRIMARY KEY,
+        first_seen TEXT,
+        last_seen TEXT,
+        last_price REAL,
+        show_count INTEGER DEFAULT 1
     );
     """)
     conn.commit()
     conn.close()
-    print("✅ База данных инициализирована")
 
 
-def save_lot(lot: dict, analysis: dict):
-    """Сохраняет лот и его текущую цену"""
+def record_digest_lot(lot_id: str, price: float) -> dict:
+    """Дедупликация дайджеста: пометка «показывали» / «цена изменилась»."""
     conn = get_conn()
     now = datetime.now().isoformat()
-
-    # Сохраняем/обновляем лот
-    conn.execute("""
-        INSERT INTO lots (id, title, url, category, region, first_seen, last_seen)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(id) DO UPDATE SET
-            title=excluded.title,
-            category=excluded.category,
-            last_seen=excluded.last_seen
-    """, (
-        lot.get("id"), lot.get("title"), lot.get("url"),
-        lot.get("category"), lot.get("region"), now, now
-    ))
-
-    # Сохраняем цену
-    price_str = analysis.get("price", "0")
-    price_num = 0
-    try:
-        price_num = float(
-            price_str.replace("млн ₽", "000000")
-                     .replace(" ₽", "")
-                     .replace(" ", "")
-                     .replace(",", ".")
+    row = conn.execute("SELECT * FROM digest_history WHERE lot_id=?", (lot_id,)).fetchone()
+    note = ""
+    if row:
+        old_price = row["last_price"] or 0
+        conn.execute(
+            "UPDATE digest_history SET last_seen=?, last_price=?, show_count=show_count+1 WHERE lot_id=?",
+            (now, price, lot_id),
         )
-        if "млн" in str(analysis.get("price", "")):
-            price_num = float(price_str.replace(" млн ₽", "").replace(",", ".")) * 1_000_000
-    except:
-        pass
+        if price and old_price and abs(price - old_price) > 1000:
+            note = f"цена изменилась: было {fmt_price(old_price)} → стало {fmt_price(price)}"
+        else:
+            note = "показывали ранее"
+    else:
+        conn.execute(
+            "INSERT INTO digest_history (lot_id, first_seen, last_seen, last_price, show_count) VALUES (?,?,?,?,1)",
+            (lot_id, now, now, price),
+        )
+    conn.commit()
+    conn.close()
+    return {"note": note}
 
+
+def fmt_price(p):
+    try:
+        p = float(p)
+        if p >= 1_000_000:
+            return f"{p/1_000_000:.1f} млн ₽"
+        return f"{int(p):,} ₽".replace(",", " ")
+    except Exception:
+        return "—"
+
+
+def save_lot_for_user(chat_id: str, lot: dict, an: dict):
+    conn = get_conn()
+    now = datetime.now().isoformat()
     conn.execute("""
-        INSERT INTO lot_prices (lot_id, price, step_current, step_total, score, action, recorded_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO saved_lots (lot_id, chat_id, title, url, price, deadline, lot_json, saved_at, reminded)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)
+        ON CONFLICT(lot_id, chat_id) DO UPDATE SET
+            title=excluded.title, url=excluded.url, price=excluded.price,
+            deadline=excluded.deadline, lot_json=excluded.lot_json, saved_at=excluded.saved_at
     """, (
-        lot.get("id"), price_num,
-        lot.get("step_current", 0), lot.get("step_total", 0),
-        analysis.get("total_score", 0), analysis.get("action", ""),
-        now
+        lot.get("id"), str(chat_id), lot.get("title", ""), lot.get("url", ""),
+        float(an.get("lot_price_raw", 0) or 0),
+        lot.get("application_deadline", ""),
+        json.dumps({"lot": lot, "an": {k: an[k] for k in an if k != "extra_checks"}}, ensure_ascii=False),
+        now,
     ))
-
     conn.commit()
     conn.close()
 
 
-def get_price_history(lot_id: str) -> list:
-    """Возвращает историю цен лота"""
+def get_saved_lots(chat_id: str) -> list:
     conn = get_conn()
-    rows = conn.execute("""
-        SELECT price, step_current, step_total, score, action, recorded_at
-        FROM lot_prices
-        WHERE lot_id = ?
-        ORDER BY recorded_at ASC
-    """, (lot_id,)).fetchall()
+    rows = conn.execute(
+        "SELECT * FROM saved_lots WHERE chat_id=? ORDER BY saved_at DESC", (str(chat_id),)
+    ).fetchall()
     conn.close()
     return [dict(r) for r in rows]
 
 
-def get_price_trend(lot_id: str) -> dict:
-    """Анализирует тренд цены"""
-    history = get_price_history(lot_id)
-    if len(history) < 2:
-        return {"trend": "новый", "drop_pct": 0, "days_tracked": 0, "history": history}
-
-    first_price = history[0]["price"]
-    last_price  = history[-1]["price"]
-    drop_pct = round((first_price - last_price) / first_price * 100) if first_price > 0 else 0
-
-    first_dt = datetime.fromisoformat(history[0]["recorded_at"])
-    last_dt  = datetime.fromisoformat(history[-1]["recorded_at"])
-    days = (last_dt - first_dt).days
-
-    return {
-        "trend":         "снижается" if drop_pct > 0 else "стабильна",
-        "first_price":   first_price,
-        "last_price":    last_price,
-        "drop_pct":      drop_pct,
-        "days_tracked":  days,
-        "checks_count":  len(history),
-        "history":       history
-    }
-
-
-def was_notified_recently(lot_id: str, hours: int = 24) -> bool:
-    """Проверяет не уведомляли ли мы об этом лоте недавно"""
+def get_due_reminders() -> list:
+    """Лоты с дедлайном через 1-2 дня, ещё не напоминали."""
     conn = get_conn()
-    from datetime import timedelta
-    cutoff = (datetime.now() - timedelta(hours=hours)).isoformat()
-    row = conn.execute("""
-        SELECT id FROM notifications
-        WHERE lot_id = ? AND sent_at > ?
-    """, (lot_id, cutoff)).fetchone()
+    rows = conn.execute(
+        "SELECT * FROM saved_lots WHERE reminded=0 AND deadline IS NOT NULL AND deadline != ''"
+    ).fetchall()
     conn.close()
-    return row is not None
+    due = []
+    now = datetime.now()
+    for r in rows:
+        dl = r["deadline"]
+        for fmt in ("%d.%m.%Y", "%d-%m-%Y", "%d/%m/%Y"):
+            try:
+                d = datetime.strptime(dl[:10], fmt)
+                days = (d - now).days
+                if 1 <= days <= 2:
+                    due.append(dict(r))
+                break
+            except ValueError:
+                continue
+    return due
 
 
-def mark_notified(lot_id: str, score: float, action: str):
-    """Отмечает что уведомление отправлено"""
+def mark_reminded(lot_id: str, chat_id: str):
     conn = get_conn()
-    conn.execute("""
-        INSERT INTO notifications (lot_id, sent_at, score, action)
-        VALUES (?, ?, ?, ?)
-    """, (lot_id, datetime.now().isoformat(), score, action))
+    conn.execute(
+        "UPDATE saved_lots SET reminded=1 WHERE lot_id=? AND chat_id=?",
+        (lot_id, str(chat_id)),
+    )
     conn.commit()
     conn.close()
-
-
-def save_stats(stats: dict):
-    """Сохраняет статистику запуска"""
-    conn = get_conn()
-    conn.execute("""
-        INSERT INTO stats (date, lots_analyzed, lots_recommended, lots_go, lots_wait, categories)
-        VALUES (?, ?, ?, ?, ?, ?)
-    """, (
-        datetime.now().strftime("%Y-%m-%d %H:%M"),
-        stats.get("analyzed", 0),
-        stats.get("recommended", 0),
-        stats.get("go", 0),
-        stats.get("wait", 0),
-        json.dumps(stats.get("categories", {}), ensure_ascii=False)
-    ))
-    conn.commit()
-    conn.close()
-
-
-def get_portfolio() -> list:
-    """Возвращает портфель наблюдаемых лотов"""
-    conn = get_conn()
-    rows = conn.execute("""
-        SELECT * FROM portfolio ORDER BY added_at DESC
-    """).fetchall()
-    conn.close()
-    return [dict(r) for r in rows]
-
-
-def add_to_portfolio(lot: dict, analysis: dict, notes: str = ""):
-    """Добавляет лот в портфель наблюдения"""
-    conn = get_conn()
-    price_str = analysis.get("price", "0")
-    market_str = analysis.get("market_price", "0")
-
-    def parse_price(s):
-        try:
-            if "млн" in str(s):
-                return float(str(s).replace(" млн ₽","").replace(",",".")) * 1_000_000
-            return float(str(s).replace(" ₽","").replace(" ",""))
-        except:
-            return 0
-
-    conn.execute("""
-        INSERT INTO portfolio (lot_id, title, url, category, buy_price, market_price, added_at, notes)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    """, (
-        lot.get("id"), lot.get("title"), lot.get("url"),
-        lot.get("category"), parse_price(price_str), parse_price(market_str),
-        datetime.now().isoformat(), notes
-    ))
-    conn.commit()
-    conn.close()
-
-
-def get_global_stats() -> dict:
-    """Общая статистика работы агента"""
-    conn = get_conn()
-    total_lots   = conn.execute("SELECT COUNT(DISTINCT lot_id) FROM lot_prices").fetchone()[0]
-    total_runs   = conn.execute("SELECT COUNT(*) FROM stats").fetchone()[0]
-    top_cats     = conn.execute("""
-        SELECT category, COUNT(*) as cnt FROM lots
-        GROUP BY category ORDER BY cnt DESC
-    """).fetchall()
-    recent_go    = conn.execute("""
-        SELECT COUNT(*) FROM lot_prices WHERE action='ВХОДИТЬ СЕЙЧАС'
-        AND recorded_at > datetime('now', '-7 days')
-    """).fetchone()[0]
-    conn.close()
-    return {
-        "total_lots":  total_lots,
-        "total_runs":  total_runs,
-        "recent_go":   recent_go,
-        "top_cats":    [(r["category"], r["cnt"]) for r in top_cats],
-    }
