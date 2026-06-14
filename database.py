@@ -36,6 +36,21 @@ def init_db():
         last_price REAL,
         show_count INTEGER DEFAULT 1
     );
+    CREATE TABLE IF NOT EXISTS agent_runs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        started_at TEXT NOT NULL,
+        finished_at TEXT,
+        run_type TEXT,
+        categories TEXT,
+        all_lots_count INTEGER DEFAULT 0,
+        result_count INTEGER DEFAULT 0,
+        alerts INTEGER DEFAULT 0,
+        skipped INTEGER DEFAULT 0,
+        partial INTEGER DEFAULT 0,
+        stats_json TEXT,
+        results_json TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_agent_runs_finished ON agent_runs(finished_at DESC);
     """)
     conn.commit()
     conn.close()
@@ -137,3 +152,97 @@ def mark_reminded(lot_id: str, chat_id: str):
     )
     conn.commit()
     conn.close()
+
+
+def _an_for_store(an: dict) -> dict:
+    skip = {"extra_checks", "verdict_card"}
+    return {k: v for k, v in an.items() if k not in skip and isinstance(v, (str, int, float, bool, type(None), list, dict))}
+
+
+def save_agent_run(started_at: str, run_type: str, categories, results: dict,
+                   all_lots_count: int, alerts: int, skipped: int,
+                   partial: bool, stats: dict) -> int:
+    """Сохраняет снимок прогона для /latest."""
+    flat = []
+    for cat, items in (results or {}).items():
+        for lot, an in items:
+            flat.append({
+                "cat": cat,
+                "lot": lot,
+                "an": _an_for_store(an),
+                "score": float(an.get("total_score", 0) or 0),
+            })
+    flat.sort(key=lambda x: x["score"], reverse=True)
+    flat = flat[:60]
+    conn = get_conn()
+    cur = conn.execute("""
+        INSERT INTO agent_runs (
+            started_at, finished_at, run_type, categories,
+            all_lots_count, result_count, alerts, skipped, partial,
+            stats_json, results_json
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?)
+    """, (
+        started_at, datetime.now().isoformat(), run_type,
+        ",".join(sorted(categories)) if categories else "",
+        all_lots_count, len(flat), alerts, skipped, 1 if partial else 0,
+        json.dumps(stats or {}, ensure_ascii=False),
+        json.dumps(flat, ensure_ascii=False),
+    ))
+    run_id = cur.lastrowid
+    conn.commit()
+    conn.close()
+    return run_id
+
+
+def get_latest_run() -> dict | None:
+    conn = get_conn()
+    row = conn.execute(
+        "SELECT * FROM agent_runs WHERE finished_at IS NOT NULL ORDER BY finished_at DESC LIMIT 1"
+    ).fetchone()
+    conn.close()
+    if not row:
+        return None
+    data = dict(row)
+    data["stats"] = json.loads(data.get("stats_json") or "{}")
+    data["results"] = json.loads(data.get("results_json") or "[]")
+    return data
+
+
+def format_latest_run_messages(run: dict, top_n: int = 12) -> list:
+    """Текст для /latest — готовый снимок без нового прогона."""
+    from analyzer import format_short_lot_message
+
+    try:
+        finished = datetime.fromisoformat(run["finished_at"]).strftime("%d.%m.%Y %H:%M")
+    except Exception:
+        finished = run.get("finished_at", "—")
+    run_type = run.get("run_type", "scheduled")
+    type_label = {"scheduled": "по расписанию", "manual": "ручной", "gha": "GitHub Actions"}.get(run_type, run_type)
+    partial = " ⚠️ _частичный_" if run.get("partial") else ""
+    stats = run.get("stats") or {}
+    header = (
+        f"📋 *Последний прогон* — {finished}{partial}\n"
+        f"Тип: {type_label} | изучено: *{run.get('all_lots_count', 0)}* лотов\n"
+        f"В снимке: *{run.get('result_count', 0)}* | 🔔 горячих: *{run.get('alerts', 0)}*\n"
+    )
+    if stats:
+        header += (
+            f"⏱ сбор {stats.get('collect_sec', 0):.0f}с | "
+            f"лёгкий {stats.get('light_sec', 0):.0f}с | "
+            f"тяжёлый {stats.get('heavy_sec', 0):.0f}с\n"
+        )
+    header += "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+    items = run.get("results") or []
+    if not items:
+        return [header + "_Лотов в снимке нет — дождитесь следующего прогона._"]
+    parts, current = [], header
+    for i, item in enumerate(items[:top_n]):
+        lot, an = item.get("lot", {}), item.get("an", {})
+        block = format_short_lot_message(lot, an, f"#{i + 1} · {item.get('score', '?')}/10") + "\n\n"
+        if len(current) + len(block) > 3800:
+            parts.append(current)
+            current = block
+        else:
+            current += block
+    parts.append(current)
+    return parts
