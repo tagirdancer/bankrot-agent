@@ -2,7 +2,7 @@
 import asyncio, os, re, logging
 from datetime import datetime, time
 from zoneinfo import ZoneInfo
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, ReplyKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
 from dotenv import load_dotenv
 load_dotenv()
@@ -40,6 +40,45 @@ REGIONS = {
     "🏔 Красноярск":      "krasnoyarskiy-kray",
     "🌏 Все регионы":     "all",
 }
+
+# Постоянное нижнее меню (reply-кнопки)
+REPLY_LATEST = "📋 Последние результаты"
+REPLY_HOT    = "🔥 Горячие лоты"
+REPLY_RUN    = "🚀 Запустить анализ"
+REPLY_SAVED  = "⭐ Сохранённые"
+REPLY_BUTTONS = {REPLY_LATEST, REPLY_HOT, REPLY_RUN, REPLY_SAVED}
+
+
+def reply_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        [
+            [KeyboardButton(REPLY_LATEST), KeyboardButton(REPLY_HOT)],
+            [KeyboardButton(REPLY_RUN), KeyboardButton(REPLY_SAVED)],
+        ],
+        resize_keyboard=True,
+        one_time_keyboard=False,
+    )
+
+
+def run_category_menu():
+    """Inline-выбор категории — как callback menu_run."""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📦 Все категории", callback_data="run_full")],
+        [
+            InlineKeyboardButton("🏠 Квартиры",  callback_data="run_квартира"),
+            InlineKeyboardButton("🏢 Коммерция", callback_data="run_коммерция"),
+        ],
+        [
+            InlineKeyboardButton("🏡 Дома",  callback_data="run_дом"),
+            InlineKeyboardButton("🌱 Земля", callback_data="run_земля"),
+        ],
+        [
+            InlineKeyboardButton("🚗 Авто",       callback_data="run_авто"),
+            InlineKeyboardButton("⚡ Горячие 9+", callback_data="run_hot"),
+        ],
+        [InlineKeyboardButton("↩️ Меню", callback_data="back_menu")],
+    ])
+
 
 def main_menu():
     return InlineKeyboardMarkup([
@@ -88,7 +127,10 @@ async def show_latest(update: Update, *, edit_message=None):
         if edit_message:
             await edit_message.edit_text(text, parse_mode="Markdown", reply_markup=main_menu())
         else:
-            await bot.send_message(chat_id=chat_id, text=text, parse_mode="Markdown", reply_markup=main_menu())
+            await bot.send_message(
+                chat_id=chat_id, text=text, parse_mode="Markdown",
+                reply_markup=reply_keyboard(),
+            )
         return
 
     parts = format_latest_run_messages(run)
@@ -98,7 +140,10 @@ async def show_latest(update: Update, *, edit_message=None):
             await bot.send_message(chat_id=chat_id, text=part, parse_mode="Markdown", disable_web_page_preview=True)
     else:
         for part in parts:
-            await bot.send_message(chat_id=chat_id, text=part, parse_mode="Markdown", disable_web_page_preview=True)
+            await bot.send_message(
+                chat_id=chat_id, text=part, parse_mode="Markdown",
+                disable_web_page_preview=True, reply_markup=reply_keyboard(),
+            )
     await bot.send_message(chat_id=chat_id, text="📱 Меню:", reply_markup=main_menu())
 
 
@@ -130,14 +175,14 @@ async def _run_agent_background(chat_id: str, cats, hot_only: bool, bot, label: 
                 f"⏰ Следующий автопрогон: 08:00 или 19:00 МСК"
             ),
             parse_mode="Markdown",
-            reply_markup=main_menu(),
+            reply_markup=reply_keyboard(),
         )
     except Exception:
         log.exception("manual agent run failed")
         await bot.send_message(
             chat_id=chat_id,
             text="⚠️ Прогон прерван с ошибкой. Попробуйте позже или /latest для прошлого снимка.",
-            reply_markup=main_menu(),
+            reply_markup=reply_keyboard(),
         )
 
 
@@ -146,6 +191,46 @@ def _cats_for_run(cat: str):
     if cat in ("full", "hot", "все"):
         return DEFAULT_CATS, cat == "hot"
     return {cat}, False
+
+
+async def _launch_agent_run(chat_id: str, cat: str, bot):
+    """Запуск прогона — общая логика для inline и reply-кнопок."""
+    region = user_region.get(str(chat_id), "moskva")
+    region_name = next((k for k, v in REGIONS.items() if v == region), region)
+    cat_names = {
+        "full": "все категории", "квартира": "квартиры", "коммерция": "коммерция",
+        "дом": "дома", "земля": "земля", "авто": "авто", "hot": "горячие 9+",
+    }
+    label = cat_names.get(cat, cat)
+    cats, hot_only = _cats_for_run(cat)
+
+    if _run_lock.locked():
+        await bot.send_message(
+            chat_id=chat_id,
+            text=(
+                "⏳ *Уже идёт прогон*\n\n"
+                "Горячие лоты приходят по мере нахождения.\n"
+                "📋 /latest — прошлый готовый снимок"
+            ),
+            parse_mode="Markdown",
+            reply_markup=reply_keyboard(),
+        )
+        return
+
+    await bot.send_message(
+        chat_id=chat_id,
+        text=(
+            f"🚀 *Анализ запущен!*\n\n"
+            f"📂 Категория: *{label}*\n"
+            f"📍 Регион: *{region_name}*\n\n"
+            f"⚡ Горячие лоты (дисконт ≥30%) — по мере тяжёлого анализа\n"
+            f"📦 Полный дайджест — в конце (~30–45 мин)\n"
+            f"📋 /latest — не ждать, открыть прошлый снимок"
+        ),
+        parse_mode="Markdown",
+        reply_markup=reply_keyboard(),
+    )
+    asyncio.create_task(_run_agent_background(str(chat_id), cats, hot_only, bot, label))
 
 
 async def scheduled_agent_job(ctx: ContextTypes.DEFAULT_TYPE):
@@ -307,10 +392,12 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "👋 *Банкротный агент*\n\n"
         "Автопрогоны: *08:00* и *19:00* (МСК)\n"
         "📋 /latest — готовые результаты без ожидания\n\n"
-        "Выберите действие:",
+        "Используйте меню внизу или inline-кнопки:",
         parse_mode="Markdown",
-        reply_markup=main_menu()
+        reply_markup=reply_keyboard(),
     )
+    await update.message.reply_text("📱 Расширенное меню:", reply_markup=main_menu())
+
 
 async def cmd_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("📱 Меню:", reply_markup=main_menu())
@@ -322,14 +409,18 @@ async def cmd_saved(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not items:
         await update.message.reply_text(
             "⭐ *Сохранённые лоты пусты*\n\nНажмите «Сохранить» под любым лотом.",
-            parse_mode="Markdown", reply_markup=main_menu(),
+            parse_mode="Markdown",
+            reply_markup=reply_keyboard(),
         )
         return
     text = "⭐ *Сохранённые лоты:*\n\n"
     for item in items[:10]:
         dl = f" | заявки до {item['deadline']}" if item.get("deadline") else ""
         text += f"• {item['title'][:50]}\n  {item['url']}{dl}\n\n"
-    await update.message.reply_text(text, parse_mode="Markdown", disable_web_page_preview=True)
+    await update.message.reply_text(
+        text, parse_mode="Markdown",
+        disable_web_page_preview=True, reply_markup=reply_keyboard(),
+    )
 
 
 async def check_reminders(ctx: ContextTypes.DEFAULT_TYPE):
@@ -477,35 +568,11 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await q.edit_message_text(
                 f"🚀 *Запустить анализ*\n\nРегион: *{region_name}*\n\nВыберите категорию:",
                 parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("📦 Все категории", callback_data="run_full")],
-                    [
-                        InlineKeyboardButton("🏠 Квартиры",  callback_data="run_квартира"),
-                        InlineKeyboardButton("🏢 Коммерция", callback_data="run_коммерция"),
-                    ],
-                    [
-                        InlineKeyboardButton("🏡 Дома",  callback_data="run_дом"),
-                        InlineKeyboardButton("🌱 Земля", callback_data="run_земля"),
-                    ],
-                    [
-                        InlineKeyboardButton("🚗 Авто",       callback_data="run_авто"),
-                        InlineKeyboardButton("⚡ Горячие 9+", callback_data="run_hot"),
-                    ],
-                    [InlineKeyboardButton("↩️ Назад", callback_data="back_menu")],
-                ])
+                reply_markup=run_category_menu(),
             )
 
     elif data.startswith("run_"):
         cat = data[4:]
-        region = user_region.get(chat, "moskva")
-        region_name = next((k for k,v in REGIONS.items() if v == region), region)
-        cat_names = {
-            "full":"все категории","квартира":"квартиры","коммерция":"коммерция",
-            "дом":"дома","земля":"земля","авто":"авто","hot":"горячие 9+",
-        }
-        label = cat_names.get(cat, cat)
-        cats, hot_only = _cats_for_run(cat)
-
         if _run_lock.locked():
             await q.edit_message_text(
                 "⏳ *Уже идёт прогон*\n\n"
@@ -516,6 +583,15 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             )
             return
 
+        region_name = next(
+            (k for k, v in REGIONS.items() if v == user_region.get(chat, "moskva")),
+            user_region.get(chat, "moskva"),
+        )
+        cat_names = {
+            "full": "все категории", "квартира": "квартиры", "коммерция": "коммерция",
+            "дом": "дома", "земля": "земля", "авто": "авто", "hot": "горячие 9+",
+        }
+        label = cat_names.get(cat, cat)
         await q.edit_message_text(
             f"🚀 *Анализ запущен!*\n\n"
             f"📂 Категория: *{label}*\n"
@@ -529,10 +605,29 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 InlineKeyboardButton("↩️ Меню", callback_data="back_menu"),
             ]]),
         )
+        cats, hot_only = _cats_for_run(cat)
         asyncio.create_task(_run_agent_background(chat, cats, hot_only, ctx.bot, label))
 
 async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text or ""
+    text = (update.message.text or "").strip()
+
+    if text in REPLY_BUTTONS:
+        if text == REPLY_LATEST:
+            await show_latest(update)
+        elif text == REPLY_SAVED:
+            await cmd_saved(update, ctx)
+        elif text == REPLY_HOT:
+            await _launch_agent_run(update.effective_chat.id, "hot", ctx.bot)
+        elif text == REPLY_RUN:
+            region = user_region.get(str(update.effective_chat.id), "moskva")
+            region_name = next((k for k, v in REGIONS.items() if v == region), region)
+            await update.message.reply_text(
+                f"🚀 *Запустить анализ*\n\nРегион: *{region_name}*\n\nВыберите категорию:",
+                parse_mode="Markdown",
+                reply_markup=run_category_menu(),
+            )
+        return
+
     lot_id = extract_lot_id(text)
     if lot_id:
         from analyzer import format_short_lot_message, lot_action_keyboard
@@ -568,14 +663,14 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "• ссылку: `https://tbankrot.ru/item?id=7629977`\n"
             "• или номер лота: `7629977`",
             parse_mode="Markdown",
-            reply_markup=main_menu(),
+            reply_markup=reply_keyboard(),
         )
         return
 
     if len(text) > 3:
         msg = await update.message.reply_text("💭 Думаю...")
         answer = await ask_expert(text)
-        await msg.edit_text(answer, reply_markup=main_menu())
+        await msg.edit_text(answer)
 
 def run():
     from database import init_db
