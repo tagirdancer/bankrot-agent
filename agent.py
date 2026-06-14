@@ -13,7 +13,8 @@ from playwright.async_api import async_playwright
 import telegram
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from analyzer import (analyze_lot, detect_type, get_lot_details, MIN_SCORE,
-                      format_short_lot_message, deep_callback_data)
+                      format_short_lot_message, lot_action_keyboard, format_price_line)
+from database import init_db, record_digest_lot
 
 load_dotenv()
 
@@ -118,62 +119,74 @@ async def enrich(lot, page, ctx):
         "vin":          details.get("vin",""),
         "cadastral":    details.get("cadastral",""),
         "address":      details.get("address",""),
+        "pdf_from_egrn": details.get("pdf_from_egrn", False),
+        "pdf_download_failed": details.get("pdf_download_failed", False),
+        "egrn_parsed":  details.get("egrn_parsed", {}),
     })
+    if details.get("pdf_from_egrn") and details.get("pdf_text"):
+        lot["egrn_pdf_text"] = details["pdf_text"]
+    for key in ("auction_format", "application_deadline", "deposit",
+                "next_reduction_date", "next_reduction_price", "area_sqm", "area_sotka"):
+        if key in details:
+            lot[key] = details[key]
     lot["parsed_at"] = datetime.now().isoformat()
     if details.get("title_full"):
         lot["title"] = details["title_full"]
     lot["category"] = detect_type(
-        f"{lot['title']} {lot.get('description','')[:300]}"
+        f"{lot['title']} {lot.get('description','')[:500]}"
     )
-    # Скачиваем ЕГРН PDF
-    try:
-        resp = await ctx.request.get(
-            f"https://files.tbankrot.ru/egrn_files/{lot['id']}.pdf"
-        )
-        if resp.status == 200:
-            with pdfplumber.open(io.BytesIO(await resp.body())) as pdf:
-                lot["pdf_text"] = "\n".join(
-                    p.extract_text() or "" for p in pdf.pages[:5]
-                )[:4000]
-            print(f"    📄 ЕГРН скачан")
-    except: pass
-    # Если PDF не скачался — берём данные со страницы лота
-    if not lot.get("pdf_text") and lot.get("description"):
-        lot["pdf_text"] = lot["description"][:2000]
-        print(f"    📝 Используем описание страницы вместо PDF")
+    if lot["category"] == "авто":
+        from analyzer import parse_auto_meta
+        lot.update(parse_auto_meta(f"{lot['title']} {lot.get('description','')}"))
+    elif not lot.get("egrn_pdf_text"):
+        try:
+            resp = await ctx.request.get(
+                f"https://files.tbankrot.ru/egrn_files/{lot['id']}.pdf"
+            )
+            raw = await resp.body() if resp.status == 200 else b""
+            if raw and b"%PDF" in raw[:10]:
+                from analyzer import apply_egrn_to_lot
+                with pdfplumber.open(io.BytesIO(raw)) as pdf:
+                    text = "\n".join(p.extract_text() or "" for p in pdf.pages[:5])[:4000]
+                if text and len(text) > 100:
+                    apply_egrn_to_lot(lot, text, True)
+                    print(f"    📄 ЕГРН скачан")
+            elif resp.status == 200:
+                lot["pdf_download_failed"] = True
+        except Exception:
+            pass
 
 
 def fmt_block(lot, an, i=0) -> str:
     medals = ["🥇","🥈","🥉","4️⃣","5️⃣","6️⃣","7️⃣","8️⃣","9️⃣","🔟",
               "1️⃣1️⃣","1️⃣2️⃣","1️⃣3️⃣","1️⃣4️⃣","1️⃣5️⃣"]
     medal  = medals[i] if i < len(medals) else f"#{i+1}"
-    disc   = an.get('discount_pct','0')
-    disc_s = f" | -{disc}%" if disc not in ('0','?','') else ""
     step    = f"\n📊 {an['step']}" if an.get('step') else ""
     urgency = f"\n{an['urgency']}" if an.get('urgency') else ""
-    mkt    = f"\n_📊 {an['market_comment']}_" if an.get('market_comment') else ""
+    mkt    = f"\n_📊 {an['market_comment']}_" if an.get('market_comment') and not an.get('market_known') else ""
     extra  = f"\n{an['extra_checks']}" if an.get('extra_checks') else ""
     check  = f"\n🔎 _{an['what_to_check']}_" if an.get('what_to_check') else ""
     encumb = f"\n🔒 {an['encumbrances']}" if an.get('encumbrances') else ""
     exit_s = f"\n🚪 Выход: {an['exit_strategy']}" if an.get('exit_strategy') else ""
     doc_st = f"\n📄 _{an['document_status']}_" if an.get('document_status') else ""
+    legal  = f"\n📋 {an['legal_text']}" if an.get('legal_text') else ""
+    auto_s = f"\n🚗 {an['auto_summary']}" if an.get('auto_summary') else ""
     simple = f"\n\n🎯 *{an['verdict_simple']}*" if an.get('verdict_simple') else ""
     region_note = " 🌍" if lot.get("is_extra") else ""
+    price_line = an.get("price_line") or format_price_line(an)
     return (
         f"{medal} *{an.get('score_label','5/10')}*"
         f" | {an.get('invest_text','📈 потенциал: средний')}"
         f" | {an.get('risk_text','🟡 риск: средний')}"
         f"{region_note}\n"
         f"{lot.get('title','')[:65]}\n"
-        f"💰 {an.get('price','—')} → рынок {an.get('market_price','—')}{disc_s}"
+        f"{price_line}"
         f"{mkt}{step}{urgency}\n"
         f"💧 Ликвидность: {an.get('liquidity_text','—')}\n"
-        f"📈 {an.get('roi_text','нет данных')}\n"
-        f"⚖️ {an.get('legal_text','—')}"
-        f"{encumb}{doc_st}"
-        f"{exit_s}"
+        f"📈 {an.get('roi_text','нет данных')}"
+        f"{doc_st}{legal}{auto_s}{encumb}{exit_s}"
         f"{extra}\n"
-        f"{an.get('action_emoji','⚠️')} *{an.get('action','?')}*\n"
+        f"{an.get('action_emoji','⚠️')} *{an.get('verdict_label') or an.get('action','?')}*\n"
         f"💡 _{an.get('strategy','')}_"
         f"{simple}"
         f"{check}\n"
@@ -226,6 +239,7 @@ async def send(msgs, reply_markup=None):
 
 
 async def run(cats=None, include_extra=True, daily=True):
+    init_db()
     if cats is None: cats = DEFAULT_CATS
     print(f"\n{'='*55}")
     print(f"🤖 Агент v9.0: {datetime.now().strftime('%d.%m.%Y %H:%M')}")
@@ -265,6 +279,9 @@ async def run(cats=None, include_extra=True, daily=True):
                     skipped += 1
                     continue
 
+                dedup = record_digest_lot(lot["id"], lot.get("price", 0))
+                if dedup.get("note"):
+                    lot["dedup_note"] = dedup["note"]
                 an    = await analyze_lot(lot)
                 score = float(an.get("total_score",0))
 
@@ -281,10 +298,7 @@ async def run(cats=None, include_extra=True, daily=True):
                     url  = lot.get("url","")
                     m    = re.search(r'id=(\d+)', url)
                     lot_id = lot.get("id") or (m.group(1) if m else "")
-                    kb = InlineKeyboardMarkup([[
-                        InlineKeyboardButton("🔍 Полный анализ",
-                            callback_data=deep_callback_data(lot_id, an, lot, lot.get("parsed_at")))
-                    ]])
+                    kb = lot_action_keyboard(lot_id, an, lot, lot.get("parsed_at"))
                     await send([format_short_lot_message(lot, an, "ГОРЯЧИЙ ЛОТ")], reply_markup=kb)
                     alerts += 1
 
