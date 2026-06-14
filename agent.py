@@ -13,7 +13,7 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from analyzer import (analyze_lot, detect_type, get_lot_details, MIN_SCORE,
                       format_short_lot_message, lot_action_keyboard, format_price_line,
                       get_rosreestr_data, is_real_estate)
-from database import init_db, record_digest_lot
+from database import init_db, record_digest_lot, save_agent_run
 
 load_dotenv()
 
@@ -418,19 +418,31 @@ def _build_results(scored, heavy_map):
     return out
 
 
-async def run(cats=None, include_extra=True, daily=True):
+async def run(cats=None, include_extra=True, daily=True, *,
+              save_to_db=None, run_type="scheduled",
+              stream_chat_id=None, stream_bot=None,
+              stream_min_score=9.0, min_result_score=None,
+              hot_only=False):
     init_db()
+    if save_to_db is None:
+        save_to_db = os.getenv("AGENT_SAVE_DB", "1") != "0"
     if cats is None:
         cats = DEFAULT_CATS
+    if min_result_score is None:
+        min_result_score = 9.0 if hot_only else MIN_SCORE
+    started_at = datetime.now().isoformat()
     start_ts = time.time()
+    sent_hot_ids = set()
     stats = {
         "collect_sec": 0, "light_sec": 0, "heavy_sec": 0,
         "light_n": 0, "heavy_n": 0, "light_timeouts": 0, "heavy_timeouts": 0,
     }
     print(f"\n{'='*55}")
-    print(f"🤖 Агент v10.0: {datetime.now().strftime('%d.%m.%Y %H:%M')}")
-    print(f"Категории: {', '.join(cats)} | Мин.балл: {MIN_SCORE}")
+    print(f"🤖 Агент v10.0: {datetime.now().strftime('%d.%m.%Y %H:%M')} [{run_type}]")
+    print(f"Категории: {', '.join(cats)} | Мин.балл: {min_result_score}")
     print(f"Бюджет: {RUN_BUDGET_SEC}s | Тяжёлых лотов макс: {MAX_HEAVY_LOTS} | ≥{HEAVY_MIN_SCORE} балл")
+    if stream_chat_id:
+        print(f"📡 Стриминг горячих ≥{stream_min_score} → chat {stream_chat_id}")
     print(f"{'='*55}\n")
 
     results = {k: [] for k in CATEGORIES}
@@ -438,6 +450,37 @@ async def run(cats=None, include_extra=True, daily=True):
     digest_sent = False
     partial = False
     heavy_map = {}
+    all_lots = []
+
+    async def _emit_hot(lot, an, preliminary=False):
+        nonlocal alerts
+        lot_id = lot.get("id")
+        if not lot_id:
+            return
+        score = float(an.get("total_score", 0))
+        if score < stream_min_score:
+            return
+        label = "⚡ ГОРЯЧИЙ ЛОТ" if not preliminary else "⚡ ГОРЯЧИЙ (предварительно)"
+        kb = lot_action_keyboard(lot_id, an, lot, lot.get("parsed_at"))
+        msg = format_short_lot_message(lot, an, label)
+        if lot_id in sent_hot_ids and not preliminary:
+            return
+        if preliminary and lot_id in sent_hot_ids:
+            return
+        sent_hot_ids.add(lot_id)
+        if stream_chat_id and stream_bot:
+            try:
+                await stream_bot.send_message(
+                    chat_id=stream_chat_id, text=msg,
+                    parse_mode="Markdown", disable_web_page_preview=True,
+                    reply_markup=kb,
+                )
+            except Exception as e:
+                print(f"  stream TG: {e}")
+        elif daily and not stream_chat_id:
+            await send([msg], reply_markup=kb)
+        if score >= 9.0:
+            alerts += 1
 
     async def _flush_if_needed(scored_list, reason=""):
         nonlocal digest_sent, partial
@@ -508,6 +551,8 @@ async def run(cats=None, include_extra=True, daily=True):
                 cat, an, score = out
                 scored.append((lot, an, score, cat))
                 stats["light_n"] += 1
+                if score >= stream_min_score and (stream_chat_id or daily):
+                    await _emit_hot(lot, an, preliminary=True)
                 extra_note = "🌍" if lot.get("is_extra") else ""
                 print(f"{cat:12} | ⭐{score:.1f} | {an.get('action', '?')} {extra_note}")
             except asyncio.TimeoutError:
@@ -555,11 +600,8 @@ async def run(cats=None, include_extra=True, daily=True):
                     print(f"→ ⭐{float(an.get('total_score', score)):.1f} | {an.get('action', '?')}")
 
                     new_score = float(an.get("total_score", 0))
-                    if new_score >= 9.0:
-                        lot_id = lot.get("id", "")
-                        kb = lot_action_keyboard(lot_id, an, lot, lot.get("parsed_at"))
-                        await send([format_short_lot_message(lot, an, "ГОРЯЧИЙ ЛОТ")], reply_markup=kb)
-                        alerts += 1
+                    if new_score >= stream_min_score and (stream_chat_id or daily):
+                        await _emit_hot(lot, an, preliminary=False)
                 except asyncio.TimeoutError:
                     stats["heavy_timeouts"] += 1
                     heavy_map[lot["id"]] = (lot, light_an)
@@ -572,6 +614,12 @@ async def run(cats=None, include_extra=True, daily=True):
         stats["heavy_sec"] = time.time() - heavy_t0
 
         results = _build_results(scored, heavy_map)
+        if hot_only or min_result_score > MIN_SCORE:
+            for cat_key in list(results.keys()):
+                results[cat_key] = [
+                    (lot, an) for lot, an in results[cat_key]
+                    if float(an.get("total_score", 0) or 0) >= min_result_score
+                ]
 
         await browser.close()
 
@@ -587,7 +635,18 @@ async def run(cats=None, include_extra=True, daily=True):
         )
         digest_sent = True
 
+    if save_to_db:
+        try:
+            rid = save_agent_run(
+                started_at, run_type, cats, results,
+                len(all_lots), alerts, skipped, partial, stats,
+            )
+            print(f"💾 Снимок прогона #{rid} сохранён в БД")
+        except Exception as e:
+            print(f"💾 save_agent_run failed: {e}")
+
     print(f"\n✅ Готово! Алертов: {alerts} | Отсеяно: {skipped} | Частичный: {partial}")
+    return results
 
 
 def daily_job():
