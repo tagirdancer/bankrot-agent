@@ -10,7 +10,7 @@ from dotenv import load_dotenv
 from playwright.async_api import async_playwright
 import telegram
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
-from analyzer import (analyze_lot, detect_type, get_lot_details, MIN_SCORE,
+from analyzer import (analyze_lot, detect_type, get_lot_details, MIN_SCORE, MIN_DISCOUNT_PCT,
                       format_short_lot_message, lot_action_keyboard, format_price_line,
                       get_rosreestr_data, is_real_estate)
 from database import init_db, record_digest_lot, save_agent_run
@@ -76,6 +76,7 @@ def _apply_details(lot, details):
         "pdf_from_egrn": details.get("pdf_from_egrn", False),
         "pdf_download_failed": details.get("pdf_download_failed", False),
         "egrn_parsed":  details.get("egrn_parsed", {}),
+        "has_egrn_on_site": details.get("has_egrn_on_site", False),
     })
     if details.get("pdf_from_egrn") and details.get("pdf_text"):
         lot["egrn_pdf_text"] = details["pdf_text"]
@@ -173,26 +174,48 @@ async def _fetch_pdf_bytes(page, url: str) -> bytes:
 
 async def _try_egrn_pdf(lot, page, ctx):
     from analyzer import apply_egrn_to_lot
-    for pdf_url in (
-        f"https://files.tbankrot.ru/egrn_files/{lot['id']}.pdf",
-        f"https://tbankrot.ru/files/egrn/{lot['id']}.pdf",
-    ):
+    from egrn_pdf import extract_pdf_text, discover_pdf_urls
+
+    desc = (lot.get("description") or "").lower()
+    lot["has_egrn_on_site"] = any(x in desc for x in (
+        "egrn", "егрн", "выписк", "rosreestr", "росреестр",
+    ))
+    html = ""
+    try:
+        html = await page.content()
+    except Exception:
+        pass
+    urls = discover_pdf_urls(html, lot["id"])
+    got_pdf = False
+
+    for pdf_url in urls:
         try:
             raw = await _fetch_pdf_bytes(page, pdf_url)
             if not raw and ctx:
                 resp = await ctx.request.get(pdf_url)
                 raw = await resp.body() if resp.status == 200 else b""
-            if raw and b"%PDF" in raw[:10]:
-                with pdfplumber.open(io.BytesIO(raw)) as pdf:
-                    text = "\n".join(p.extract_text() or "" for p in pdf.pages[:8])[:6000]
-                if text and len(text) > 100:
-                    apply_egrn_to_lot(lot, text, True)
-                    print(f"    📄 ЕГРН скачан ({len(text)} симв.)")
-                    return
             if not raw:
-                lot["pdf_download_failed"] = True
-        except Exception:
+                continue
+            if b"%PDF" not in raw[:10]:
+                continue
+            got_pdf = True
+            lot["has_egrn_on_site"] = True
+            text, method = extract_pdf_text(raw)
+            lot["egrn_extract_method"] = method
+            if text and len(text) >= 80:
+                apply_egrn_to_lot(lot, text, True)
+                print(f"    📄 ЕГРН ({method}, {len(text)} симв.)")
+                return
+            print(f"    📄 PDF {len(raw)} байт — текст не извлечён ({method})")
+            lot["egrn_ocr_failed"] = True
+        except Exception as e:
+            print(f"    PDF err: {e}")
             continue
+
+    if got_pdf:
+        lot["egrn_ocr_failed"] = True
+    elif lot.get("has_egrn_on_site"):
+        lot["pdf_download_failed"] = True
 
 
 async def collect(page, regions, max_pages=MAX_PAGES) -> list:
@@ -460,6 +483,8 @@ async def run(cats=None, include_extra=True, daily=True, *,
         score = float(an.get("total_score", 0))
         if score < stream_min_score:
             return
+        if not an.get("discount_ok"):
+            return
         label = "⚡ ГОРЯЧИЙ ЛОТ" if not preliminary else "⚡ ГОРЯЧИЙ (предварительно)"
         kb = lot_action_keyboard(lot_id, an, lot, lot.get("parsed_at"))
         msg = format_short_lot_message(lot, an, label)
@@ -551,8 +576,6 @@ async def run(cats=None, include_extra=True, daily=True, *,
                 cat, an, score = out
                 scored.append((lot, an, score, cat))
                 stats["light_n"] += 1
-                if score >= stream_min_score and (stream_chat_id or daily):
-                    await _emit_hot(lot, an, preliminary=True)
                 extra_note = "🌍" if lot.get("is_extra") else ""
                 print(f"{cat:12} | ⭐{score:.1f} | {an.get('action', '?')} {extra_note}")
             except asyncio.TimeoutError:
@@ -569,7 +592,6 @@ async def run(cats=None, include_extra=True, daily=True, *,
 
         # Отбор топ-кандидатов для тяжёлого анализа
         scored.sort(key=lambda x: x[2], reverse=True)
-        # Приоритет: все 9+ баллов, затем остальные ≥ HEAVY_MIN_SCORE
         must_heavy = [(lot, an, score, cat) for lot, an, score, cat in scored if score >= 9.0]
         must_ids = {lot["id"] for lot, _, _, _ in must_heavy}
         rest_heavy = [
@@ -577,7 +599,7 @@ async def run(cats=None, include_extra=True, daily=True, *,
             if score >= HEAVY_MIN_SCORE and lot["id"] not in must_ids
         ]
         heavy_queue = (must_heavy + rest_heavy)[:MAX_HEAVY_LOTS]
-        print(f"🎯 В тяжёлый анализ: {len(heavy_queue)} лотов (балл ≥ {HEAVY_MIN_SCORE})\n")
+        print(f"🎯 В тяжёлый анализ: {len(heavy_queue)} лотов (балл ≥ {HEAVY_MIN_SCORE}, дисконт ≥{MIN_DISCOUNT_PCT}% после оценки)\n")
 
         heavy_map = {}  # lot id -> (lot, an)
         heavy_t0 = time.time()
@@ -620,6 +642,12 @@ async def run(cats=None, include_extra=True, daily=True, *,
                     (lot, an) for lot, an in results[cat_key]
                     if float(an.get("total_score", 0) or 0) >= min_result_score
                 ]
+        # Отсев: только реальный дисконт ≥ MIN_DISCOUNT_PCT
+        for cat_key in list(results.keys()):
+            results[cat_key] = [
+                (lot, an) for lot, an in results[cat_key]
+                if an.get("discount_ok")
+            ]
 
         await browser.close()
 
