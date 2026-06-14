@@ -79,13 +79,6 @@ async def show_latest(update: Update, *, edit_message=None):
     chat_id = update.effective_chat.id
     bot = update.get_bot()
 
-    async def _reply(text, **kw):
-        if edit_message:
-            await edit_message.edit_text(text, **kw)
-            edit_message = None
-        else:
-            await bot.send_message(chat_id=chat_id, text=text, **kw)
-
     if not run:
         text = (
             "📋 *Последних результатов пока нет.*\n\n"
