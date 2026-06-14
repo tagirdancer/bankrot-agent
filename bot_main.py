@@ -155,141 +155,69 @@ async def fetch_and_analyze_lot(lot_id: str):
         page = await ctx.new_page()
         await enrich(lot, page, ctx)
         await browser.close()
+    from database import record_digest_lot
+    dedup = record_digest_lot(lot_id, lot.get("price", 0))
+    if dedup.get("note"):
+        lot["dedup_note"] = dedup["note"]
     an = await analyze_lot(lot)
     lot["parsed_at"] = parsed_at.isoformat()
     return lot, an, parsed_at
 
 
 async def deep_analysis(lot_id: str, facts: dict = None) -> str:
-    import httpx
+    """Полный анализ — детерминированный вердикт без LLM (анти-галлюцинации)."""
+    import json
     from analyzer import build_verification_links
+    from verdict import run_verdict_pipeline
+
     facts = facts or {}
-    if not GROQ_KEY:
-        log.error("deep_analysis: GROQ_API_KEY отсутствует в окружении (проверьте Railway -> Variables)")
-        return ("\u26a0\ufe0f На сервере не настроен ключ GROQ_API_KEY.\n"
-                "Добавьте переменную GROQ_API_KEY в Railway -> сервис web -> Variables.")
     url = f"https://tbankrot.ru/item?id={lot_id}"
+    cached = lot_cache.get(lot_id, {})
+    lot = cached.get("lot") or {"id": lot_id, "url": url}
+    an = cached.get("an")
 
-    # Берём ТОЛЬКО реальные числа лота (пришли из дайджеста). Ничего не выдумываем.
-    def fmt_money(v):
-        try:
-            v = float(v)
-            if v >= 1_000_000:
-                return f"{v / 1_000_000:.1f} млн ₽"
-            if v > 0:
-                return f"{int(v):,} ₽".replace(",", " ")
-        except Exception:
-            pass
-        return None
-
-    price_s = fmt_money(facts.get("price_raw"))
-    mkt_s = fmt_money(facts.get("market_raw"))
-    disc = facts.get("disc")
-    parts = facts.get("parts")
-
-    known = [f"Ссылка на карточку торгов: {url}"]
-    known.append(f"Цена лота: {price_s}" if price_s else "Цена лота: НЕТ ДАННЫХ")
-    if mkt_s and disc and str(disc) not in ("0", "?", ""):
-        known.append(f"Ориентир рыночной цены (из дайджеста): {mkt_s}")
-        known.append(f"Дисконт к рынку (из дайджеста): {disc}%")
+    if an and an.get("verdict_card"):
+        card = an["verdict_card"]
+        facts_json = an.get("facts_json", {})
     else:
-        known.append("Рыночная цена и дисконт: НЕТ ДАННЫХ")
-    if parts not in (None, "", "None"):
-        known.append(f"Количество заявок: {parts}")
-    else:
-        known.append("Количество заявок: НЕТ ДАННЫХ")
-
-    cadastral = facts.get("cadastral", "")
-    address = facts.get("address", "")
-    if cadastral:
-        known.append(f"Кадастровый номер: {cadastral}")
-    else:
-        known.append("Кадастровый номер: не найден в карточке")
-    if address:
-        known.append(f"Адрес: {address}")
+        partial = {
+            "lot_price_raw": facts.get("price_raw") or lot.get("price"),
+            "market_price_raw": facts.get("market_raw"),
+            "discount_pct": facts.get("disc", "0"),
+            "land_manual_market": lot.get("category") == "земля",
+        }
+        vr = run_verdict_pipeline(lot, partial)
+        card = vr["verdict_card"]
+        facts_json = vr["facts_json"]
 
     parsed_hdr = ""
-    pts = facts.get("parsed_at")
+    pts = facts.get("parsed_at") or cached.get("parsed_at")
     if pts:
         try:
             if isinstance(pts, int):
                 parsed_hdr = datetime.fromtimestamp(pts).strftime("%d.%m.%Y %H:%M")
             else:
                 parsed_hdr = datetime.fromisoformat(str(pts)).strftime("%d.%m.%Y %H:%M")
-            known.append(f"Дата спарсинга данных: {parsed_hdr}")
         except Exception:
             pass
 
-    verify_links = build_verification_links(cadastral, address)
-    known_block = "\n".join("- " + k for k in known)
+    cadastral = facts.get("cadastral") or cached.get("cadastral", "")
+    address = facts.get("address") or cached.get("address", "")
+    lot_type = lot.get("category") or (an or {}).get("lot_type", "")
+    vin = lot.get("vin") or ""
+    verify_links = build_verification_links(cadastral, address, vin, lot_type)
 
-    prompt = f"""Ты помогаешь инвестору проверить лот с банкротных торгов в России.
+    clean_facts = {k: v for k, v in facts_json.items() if not str(k).startswith("_")}
+    json_block = json.dumps(clean_facts, ensure_ascii=False, indent=2)
 
-КРИТИЧЕСКИ ВАЖНЫЕ ПРАВИЛА (нарушать строго запрещено):
-- У тебя НЕТ доступа к Росреестру, ФССП, ЕГРН и полной карточке торгов.
-- Используй ТОЛЬКО данные из блока «ИЗВЕСТНЫЕ ДАННЫЕ» ниже.
-- ЗАПРЕЩЕНО выдумывать конкретные числа: сумму ареста, долги ЖКХ, налоги,
-  кадастровую стоимость, число прописанных, количество заявок, рыночную цену —
-  если их НЕТ в известных данных. Не придумывай «правдоподобные» числа.
-- Если данных для раздела нет — пиши: «НЕТ ДАННЫХ — проверить самостоятельно:
-  [где именно проверить]».
-- Рыночную цену и дисконт бери ТОЛЬКО из известных данных и НЕ пересчитывай.
+    parts = []
+    if parsed_hdr:
+        parts.append(f"📅 Данные спарсены: {parsed_hdr}\n")
+    parts.append(card)
+    parts.append(f"\n*Извлечённые факты (шаг 1):*\n```\n{json_block}\n```")
+    parts.append(f"\n*Ссылки для ручной проверки:*\n{verify_links}")
+    return "\n".join(parts)
 
-ИЗВЕСТНЫЕ ДАННЫЕ:
-{known_block}
-
-Сделай ЧЕК-ЛИСТ ПРОВЕРКИ (не отчёт с готовыми фактами) строго по разделам:
-
-✅ ЧТО ТОЧНО ИЗВЕСТНО ИЗ КАРТОЧКИ
-- только факты из «ИЗВЕСТНЫЕ ДАННЫЕ», без додумывания.
-
-🔎 ЧТО ОБЯЗАТЕЛЬНО ПРОВЕРИТЬ САМОМУ (И ГДЕ)
-Используй ТОЛЬКО эти прямые ссылки (не придумывай другие URL):
-{verify_links}
-- долги ЖКХ и капремонт — в управляющей компании / по квитанциям;
-- прописанные лица — выписка из домовой книги;
-- условия торгов, задаток, шаг цены, дедлайн — карточка лота на площадке.
-Для каждого пункта укажи, ГДЕ это проверить. Если кадастрового номера нет — так и напиши.
-
-❓ ВОПРОСЫ К ОБЪЕКТУ
-- что спросить у организатора торгов и на что обратить внимание.
-
-💡 СТРАТЕГИИ И ВЕРДИКТ (оценочно, требует подтверждения данных)
-- 1-2 стратегии и короткий вердикт с пометкой «оценочно».
-- не называй конкретных сумм прибыли, если нет цен.
-
-Пиши по-русски, кратко, по пунктам. Без выдуманных чисел."""
-
-    try:
-        async with httpx.AsyncClient(timeout=90) as client:
-            resp = await client.post(
-                GROQ_URL,
-                headers={"Authorization": f"Bearer {GROQ_KEY}",
-                         "Content-Type": "application/json"},
-                json={
-                    "model": "llama-3.1-8b-instant",
-                    "messages": [{"role": "user", "content": prompt}],
-                    "max_tokens": 1500,
-                    "temperature": 0.3,
-                }
-            )
-            if resp.status_code != 200:
-                log.error("deep_analysis: Groq статус %s, тело: %s",
-                          resp.status_code, resp.text[:500])
-                return (f"\u26a0\ufe0f Анализ временно недоступен (Groq ответил {resp.status_code}).\n"
-                        f"Причина записана в логи Railway. Попробуйте позже.")
-            data = resp.json()
-            choices = data.get("choices")
-            if choices:
-                body = choices[0]["message"]["content"]
-                if parsed_hdr:
-                    body = f"📅 Данные спарсены: {parsed_hdr}\n\n{body}"
-                return body
-            log.error("deep_analysis: в ответе Groq нет choices: %s", str(data)[:500])
-    except Exception:
-        log.exception("full_analysis failed: ошибка запроса к Groq")
-        return "\u26a0\ufe0f Не удалось получить анализ (ошибка запроса). Подробности в логах Railway."
-    return "Не удалось получить анализ. Попробуйте позже."
 
 # Хранилище выбранного региона
 user_region = {}
@@ -306,9 +234,70 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cmd_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("📱 Меню:", reply_markup=main_menu())
 
+
+async def cmd_saved(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    from database import get_saved_lots
+    items = get_saved_lots(update.message.chat_id)
+    if not items:
+        await update.message.reply_text(
+            "⭐ *Сохранённые лоты пусты*\n\nНажмите «Сохранить» под любым лотом.",
+            parse_mode="Markdown", reply_markup=main_menu(),
+        )
+        return
+    text = "⭐ *Сохранённые лоты:*\n\n"
+    for item in items[:10]:
+        dl = f" | заявки до {item['deadline']}" if item.get("deadline") else ""
+        text += f"• {item['title'][:50]}\n  {item['url']}{dl}\n\n"
+    await update.message.reply_text(text, parse_mode="Markdown", disable_web_page_preview=True)
+
+
+async def check_reminders(ctx: ContextTypes.DEFAULT_TYPE):
+    from database import get_due_reminders, mark_reminded
+    for item in get_due_reminders():
+        try:
+            await ctx.bot.send_message(
+                chat_id=item["chat_id"],
+                text=(
+                    f"⏰ *Напоминание*\n\n"
+                    f"Через 1–2 дня дедлайн заявок по лоту:\n"
+                    f"{item['title'][:60]}\n"
+                    f"📅 до {item['deadline']}\n"
+                    f"🔗 {item['url']}"
+                ),
+                parse_mode="Markdown",
+                disable_web_page_preview=True,
+            )
+            mark_reminded(item["lot_id"], item["chat_id"])
+        except Exception:
+            log.exception("reminder failed for lot %s", item.get("lot_id"))
+
+
 async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q    = update.callback_query
     data = q.data
+
+    if data.startswith("save_"):
+        lot_id = data[5:]
+        cached = lot_cache.get(lot_id, {})
+        lot, an = cached.get("lot", {}), cached.get("an", {})
+        if not (lot and an):
+            await q.answer("Загружаю лот...")
+            try:
+                lot, an, parsed_at = await fetch_and_analyze_lot(lot_id)
+                lot_cache[lot_id] = {
+                    "lot": lot, "an": an,
+                    "cadastral": lot.get("cadastral", ""),
+                    "address": lot.get("address", ""),
+                    "parsed_at": int(parsed_at.timestamp()),
+                }
+            except Exception:
+                log.exception("save failed for lot %s", lot_id)
+                await q.answer("Не удалось загрузить лот", show_alert=True)
+                return
+        from database import save_lot_for_user
+        save_lot_for_user(str(q.message.chat_id), lot, an)
+        await q.answer("⭐ Лот сохранён")
+        return
 
     if data.startswith("deep_"):
         payload = data[5:]
@@ -324,6 +313,19 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             except ValueError:
                 pass
         cached = lot_cache.get(lot_id, {})
+        if not cached.get("an"):
+            await q.answer("Загружаю лот...")
+            try:
+                lot, an, parsed_at = await fetch_and_analyze_lot(lot_id)
+                lot_cache[lot_id] = {
+                    "lot": lot, "an": an,
+                    "cadastral": lot.get("cadastral", ""),
+                    "address": lot.get("address", ""),
+                    "parsed_at": int(parsed_at.timestamp()),
+                }
+            except Exception:
+                log.exception("deep fetch failed for lot %s", lot_id)
+        cached = lot_cache.get(lot_id, {})
         if cached.get("cadastral"):
             facts["cadastral"] = cached["cadastral"]
         if cached.get("address"):
@@ -332,7 +334,7 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             facts["parsed_at"] = cached["parsed_at"]
         try:
             await q.answer("Анализирую...")
-            await q.message.reply_text("🔍 Готовлю чек-лист проверки лота, подождите ~30 секунд...")
+            await q.message.reply_text("🔍 Готовлю вердикт по лоту (~1 мин)...")
             analysis = await deep_analysis(lot_id, facts)
             try:
                 await q.message.reply_text(analysis, parse_mode="Markdown")
@@ -443,19 +445,17 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     text = update.message.text or ""
     lot_id = extract_lot_id(text)
     if lot_id:
-        from analyzer import format_short_lot_message, deep_callback_data
+        from analyzer import format_short_lot_message, lot_action_keyboard
         msg = await update.message.reply_text("⏳ Парсю и анализирую лот (~1 мин)...")
         try:
             lot, an, parsed_at = await fetch_and_analyze_lot(lot_id)
             lot_cache[lot_id] = {
+                "lot": lot, "an": an,
                 "cadastral": lot.get("cadastral", ""),
                 "address": lot.get("address", ""),
                 "parsed_at": int(parsed_at.timestamp()),
             }
-            kb = InlineKeyboardMarkup([[
-                InlineKeyboardButton("🔍 Полный анализ",
-                    callback_data=deep_callback_data(lot_id, an, lot, parsed_at))
-            ]])
+            kb = lot_action_keyboard(lot_id, an, lot, parsed_at)
             await msg.edit_text(
                 format_short_lot_message(lot, an),
                 parse_mode="Markdown",
@@ -488,12 +488,16 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await msg.edit_text(answer, reply_markup=main_menu())
 
 def run():
+    from database import init_db
+    init_db()
     app = Application.builder().token(TG_TOKEN).build()
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("menu",  cmd_menu))
     app.add_handler(CommandHandler("m",     cmd_menu))
+    app.add_handler(CommandHandler("saved", cmd_saved))
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.job_queue.run_repeating(check_reminders, interval=3600, first=120)
     print("Bot started!")
     app.run_polling(drop_pending_updates=True)
 
