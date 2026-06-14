@@ -56,7 +56,9 @@ async def login(page) -> bool:
         )
         await page.fill("input[type='email'], input[placeholder*='mail']", LOGIN)
         await page.wait_for_timeout(500)
-        await page.fill("input[type='password']", PASSWORD)
+        pwd = page.locator("input[type='password']:visible").first
+        await pwd.wait_for(state="visible", timeout=8000)
+        await pwd.fill(PASSWORD)
         await page.wait_for_timeout(500)
         for btn in await page.query_selector_all("button"):
             if (await btn.inner_text()).strip() == "Войти":
@@ -108,7 +110,9 @@ async def collect(page, regions, max_pages=MAX_PAGES) -> list:
 
 
 async def enrich(lot, page, ctx):
-    """Заходит на страницу лота и скачивает ЕГРН PDF"""
+    """Заходит на страницу лота и скачивает ЕГРН PDF (после авторизации — иначе 403)."""
+    if LOGIN and PASSWORD:
+        await login(page)
     details = await get_lot_details(lot["url"], page)
     lot.update({
         "price":        details.get("price", 0),
@@ -139,22 +143,25 @@ async def enrich(lot, page, ctx):
         from analyzer import parse_auto_meta
         lot.update(parse_auto_meta(f"{lot['title']} {lot.get('description','')}"))
     elif not lot.get("egrn_pdf_text"):
-        try:
-            resp = await ctx.request.get(
-                f"https://files.tbankrot.ru/egrn_files/{lot['id']}.pdf"
-            )
-            raw = await resp.body() if resp.status == 200 else b""
-            if raw and b"%PDF" in raw[:10]:
-                from analyzer import apply_egrn_to_lot
-                with pdfplumber.open(io.BytesIO(raw)) as pdf:
-                    text = "\n".join(p.extract_text() or "" for p in pdf.pages[:5])[:4000]
-                if text and len(text) > 100:
-                    apply_egrn_to_lot(lot, text, True)
-                    print(f"    📄 ЕГРН скачан")
-            elif resp.status == 200:
-                lot["pdf_download_failed"] = True
-        except Exception:
-            pass
+        for pdf_url in (
+            f"https://files.tbankrot.ru/egrn_files/{lot['id']}.pdf",
+            f"https://tbankrot.ru/files/egrn/{lot['id']}.pdf",
+        ):
+            try:
+                resp = await ctx.request.get(pdf_url)
+                raw = await resp.body() if resp.status == 200 else b""
+                if raw and b"%PDF" in raw[:10]:
+                    from analyzer import apply_egrn_to_lot
+                    with pdfplumber.open(io.BytesIO(raw)) as pdf:
+                        text = "\n".join(p.extract_text() or "" for p in pdf.pages[:8])[:6000]
+                    if text and len(text) > 100:
+                        apply_egrn_to_lot(lot, text, True)
+                        print(f"    📄 ЕГРН скачан ({len(text)} симв.)")
+                        break
+                elif resp.status in (403, 404):
+                    lot["pdf_download_failed"] = True
+            except Exception:
+                continue
 
 
 def fmt_block(lot, an, i=0) -> str:
