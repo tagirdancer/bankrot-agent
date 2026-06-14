@@ -545,20 +545,9 @@ async def get_lot_details(url: str, page) -> dict:
         if kad: details["cadastral"] = kad.group(1)
         lot_id = re.search(r'id=(\d+)', url)
         pre_cat = detect_type(f"{details.get('title_full', '')} {text[:800]}")
-        if lot_id:
+        if lot_id and pre_cat != "авто":
             lid = lot_id.group(1)
-            pdf_text = await download_pdf(lid)
-            if pdf_text:
-                details["pdf_text"] = pdf_text
-                details["pdf_from_egrn"] = True
-                egrn = parse_egrn_pdf(pdf_text)
-                details["egrn_parsed"] = egrn
-                if egrn.get("cadastral"):
-                    details["cadastral"] = egrn["cadastral"]
-                if egrn.get("address"):
-                    details["address"] = egrn["address"]
-            else:
-                details["pdf_download_failed"] = True
+            # PDF качается в agent.enrich после login (без cookies → 403)
             try:
                 await page.goto(f"https://tbankrot.ru/analytics/{lid}", timeout=15000)
                 await page.wait_for_timeout(1500)
