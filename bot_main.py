@@ -497,7 +497,10 @@ def run():
     app.add_handler(CommandHandler("saved", cmd_saved))
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    app.job_queue.run_repeating(check_reminders, interval=3600, first=120)
+    if app.job_queue:
+        app.job_queue.run_repeating(check_reminders, interval=3600, first=120)
+    else:
+        log.warning("JobQueue недоступен — напоминания /saved отключены (нужен python-telegram-bot[job-queue])")
     print("Bot started!")
     app.run_polling(drop_pending_updates=True)
 
