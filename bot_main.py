@@ -153,7 +153,9 @@ async def fetch_and_analyze_lot(lot_id: str):
             "AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36"
         ))
         page = await ctx.new_page()
-        await enrich(lot, page, ctx)
+        from agent import login
+        await login(page)
+        await enrich(lot, page, ctx, heavy=True)
         await browser.close()
     from database import record_digest_lot
     dedup = record_digest_lot(lot_id, lot.get("price", 0))
