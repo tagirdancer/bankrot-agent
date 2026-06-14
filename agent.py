@@ -45,30 +45,108 @@ DEFAULT_CATS = {k for k,v in CATEGORIES.items() if v["default"]}
 
 
 async def login(page) -> bool:
+    if not LOGIN or not PASSWORD:
+        return False
     try:
         await page.goto("https://tbankrot.ru/", timeout=30000)
         await page.wait_for_timeout(2000)
+        if await page.locator("text=Выйти").count():
+            print("✅ Уже авторизован")
+            return True
         await page.click("text=Войти", timeout=8000)
-        await page.wait_for_timeout(2000)
-        await page.wait_for_selector(
-            "input[type='email'], input[placeholder*='mail']",
-            timeout=8000
-        )
-        await page.fill("input[type='email'], input[placeholder*='mail']", LOGIN)
-        await page.wait_for_timeout(500)
-        pwd = page.locator("input[type='password']:visible").first
-        await pwd.wait_for(state="visible", timeout=8000)
+        await page.wait_for_timeout(1500)
+        for tab in ("Email", "E-mail", "Почта", "email"):
+            try:
+                t = page.locator(f"text={tab}").first
+                if await t.count() and await t.is_visible():
+                    await t.click()
+                    await page.wait_for_timeout(400)
+                    break
+            except Exception:
+                pass
+        email_sel = "input[type='email'], input[name*='mail'], input[placeholder*='mail' i]"
+        await page.wait_for_selector(email_sel, timeout=8000)
+        await page.fill(email_sel, LOGIN)
+        await page.wait_for_timeout(400)
+        pwd = None
+        for sel in (
+            "[role='dialog'] input[type='password']:visible",
+            "form:visible input[type='password']",
+            "input[type='password']:visible",
+        ):
+            loc = page.locator(sel).first
+            if await loc.count():
+                try:
+                    await loc.wait_for(state="visible", timeout=3000)
+                    pwd = loc
+                    break
+                except Exception:
+                    continue
+        if not pwd:
+            raise RuntimeError("поле пароля не найдено")
         await pwd.fill(PASSWORD)
-        await page.wait_for_timeout(500)
+        await page.wait_for_timeout(400)
         for btn in await page.query_selector_all("button"):
             if (await btn.inner_text()).strip() == "Войти":
-                await btn.click(); break
-        await page.wait_for_timeout(3000)
-        print("✅ Авторизован")
-        return True
+                await btn.click()
+                break
+        await page.wait_for_timeout(3500)
+        if await page.locator("text=Выйти").count():
+            print("✅ Авторизован")
+            return True
+        await page.goto("https://tbankrot.ru/", timeout=20000)
+        await page.wait_for_timeout(1500)
+        ok = await page.locator("text=Выйти").count() > 0
+        print("✅ Авторизован" if ok else "⚠️ Авторизация не подтверждена")
+        return ok
     except Exception as e:
         print(f"⚠️ Авторизация: {e}")
         return False
+
+
+async def _fetch_pdf_bytes(page, url: str) -> bytes:
+    """Скачивает PDF с cookies сессии браузера (ctx.request без login → 403)."""
+    try:
+        data = await page.evaluate(
+            """async (url) => {
+                const r = await fetch(url, {credentials: 'include'});
+                if (!r.ok) return {ok: false, status: r.status};
+                const buf = await r.arrayBuffer();
+                return {ok: true, bytes: Array.from(new Uint8Array(buf))};
+            }""",
+            url,
+        )
+        if data and data.get("ok") and data.get("bytes"):
+            return bytes(data["bytes"])
+        if data and data.get("status") in (403, 404):
+            return b""
+    except Exception:
+        pass
+    return b""
+
+
+async def _try_egrn_pdf(lot, page, ctx):
+    from analyzer import apply_egrn_to_lot
+    for pdf_url in (
+        f"https://files.tbankrot.ru/egrn_files/{lot['id']}.pdf",
+        f"https://tbankrot.ru/files/egrn/{lot['id']}.pdf",
+    ):
+        try:
+            raw = await _fetch_pdf_bytes(page, pdf_url)
+            if not raw and ctx:
+                resp = await ctx.request.get(pdf_url)
+                raw = await resp.body() if resp.status == 200 else b""
+            if raw and b"%PDF" in raw[:10]:
+                with pdfplumber.open(io.BytesIO(raw)) as pdf:
+                    text = "\n".join(p.extract_text() or "" for p in pdf.pages[:8])[:6000]
+                if text and len(text) > 100:
+                    apply_egrn_to_lot(lot, text, True)
+                    print(f"    📄 ЕГРН скачан ({len(text)} симв.)")
+                    return
+            if not raw:
+                lot["pdf_download_failed"] = True
+        except Exception:
+            continue
 
 
 async def collect(page, regions, max_pages=MAX_PAGES) -> list:
@@ -143,25 +221,7 @@ async def enrich(lot, page, ctx):
         from analyzer import parse_auto_meta
         lot.update(parse_auto_meta(f"{lot['title']} {lot.get('description','')}"))
     elif not lot.get("egrn_pdf_text"):
-        for pdf_url in (
-            f"https://files.tbankrot.ru/egrn_files/{lot['id']}.pdf",
-            f"https://tbankrot.ru/files/egrn/{lot['id']}.pdf",
-        ):
-            try:
-                resp = await ctx.request.get(pdf_url)
-                raw = await resp.body() if resp.status == 200 else b""
-                if raw and b"%PDF" in raw[:10]:
-                    from analyzer import apply_egrn_to_lot
-                    with pdfplumber.open(io.BytesIO(raw)) as pdf:
-                        text = "\n".join(p.extract_text() or "" for p in pdf.pages[:8])[:6000]
-                    if text and len(text) > 100:
-                        apply_egrn_to_lot(lot, text, True)
-                        print(f"    📄 ЕГРН скачан ({len(text)} симв.)")
-                        break
-                elif resp.status in (403, 404):
-                    lot["pdf_download_failed"] = True
-            except Exception:
-                continue
+        await _try_egrn_pdf(lot, page, ctx)
 
 
 def fmt_block(lot, an, i=0) -> str:
