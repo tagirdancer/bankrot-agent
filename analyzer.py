@@ -448,7 +448,7 @@ async def download_pdf(lot_id: str) -> str:
             f"https://tbankrot.ru/files/egrn/{lot_id}.pdf",
             f"https://tbankrot.ru/item/egrn?id={lot_id}",
         ]
-        async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
+        async with httpx.AsyncClient(timeout=20, follow_redirects=True, trust_env=False) as client:
             for url in pdf_urls:
                 try:
                     resp = await client.get(url, headers=headers)
@@ -470,7 +470,7 @@ async def get_rosreestr_data(cadastral: str) -> str:
     if not cadastral:
         return ""
     try:
-        async with httpx.AsyncClient(timeout=15) as client:
+        async with httpx.AsyncClient(timeout=15, trust_env=False) as client:
             resp = await client.get(
                 "https://pkk.rosreestr.ru/api/features/5",
                 params={"text": cadastral, "limit": 1, "skip": 0},
@@ -728,7 +728,7 @@ risk_level: низкий / средний / высокий / критическ�
                   "использую запасной разбор по типу объекта")
     else:
         try:
-            async with httpx.AsyncClient(timeout=60) as client:
+            async with httpx.AsyncClient(timeout=60, trust_env=False) as client:
                 resp = await client.post(
                     GROQ_URL,
                     headers={"Authorization": f"Bearer {GROQ_KEY}", "Content-Type": "application/json"},
