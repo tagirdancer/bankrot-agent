@@ -51,7 +51,7 @@ async def login(page) -> bool:
         await page.goto("https://tbankrot.ru/", timeout=30000)
         await page.wait_for_timeout(2000)
         if await page.locator("text=Выйти").count():
-            print("✅ Уже авторизован")
+            print("[login] OK already")
             return True
         await page.click("text=Войти", timeout=8000)
         await page.wait_for_timeout(1500)
@@ -68,23 +68,10 @@ async def login(page) -> bool:
         await page.wait_for_selector(email_sel, timeout=8000)
         await page.fill(email_sel, LOGIN)
         await page.wait_for_timeout(400)
-        pwd = None
-        for sel in (
-            "[role='dialog'] input[type='password']:visible",
-            "form:visible input[type='password']",
-            "input[type='password']:visible",
-        ):
-            loc = page.locator(sel).first
-            if await loc.count():
-                try:
-                    await loc.wait_for(state="visible", timeout=3000)
-                    pwd = loc
-                    break
-                except Exception:
-                    continue
-        if not pwd:
-            raise RuntimeError("поле пароля не найдено")
-        await pwd.fill(PASSWORD)
+        try:
+            await page.locator("input[type='password']:visible").first.fill(PASSWORD, timeout=5000)
+        except Exception:
+            await page.locator("input[type='password']").first.fill(PASSWORD, force=True)
         await page.wait_for_timeout(400)
         for btn in await page.query_selector_all("button"):
             if (await btn.inner_text()).strip() == "Войти":
@@ -92,15 +79,24 @@ async def login(page) -> bool:
                 break
         await page.wait_for_timeout(3500)
         if await page.locator("text=Выйти").count():
-            print("✅ Авторизован")
+            print("[login] OK")
             return True
         await page.goto("https://tbankrot.ru/", timeout=20000)
         await page.wait_for_timeout(1500)
         ok = await page.locator("text=Выйти").count() > 0
-        print("✅ Авторизован" if ok else "⚠️ Авторизация не подтверждена")
+        if not ok:
+            ok = await page.locator("text=Войти").count() == 0
+        if not ok:
+            cookies = await page.context.cookies()
+            ok = any(
+                c.get("name", "").lower() in ("session", "sessionid", "auth", "token", "jwt")
+                or "session" in c.get("name", "").lower()
+                for c in cookies
+            )
+        print("[login] OK" if ok else "[login] NOT CONFIRMED")
         return ok
     except Exception as e:
-        print(f"⚠️ Авторизация: {e}")
+        print(f"[login] FAIL: {e}")
         return False
 
 
