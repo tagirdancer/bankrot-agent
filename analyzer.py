@@ -20,6 +20,7 @@ GROQ_KEY = os.getenv("GROQ_API_KEY")
 COOKIES  = os.getenv("TBANKROT_COOKIES", "")
 MODEL    = "llama-3.1-8b-instant"
 MIN_SCORE = 0.0
+MIN_DISCOUNT_PCT = float(os.getenv("MIN_DISCOUNT_PCT", "30"))
 
 REGION_LABELS = {
     "moskva": "Москва", "moskovskaya-oblast": "Московская область",
@@ -226,82 +227,164 @@ def is_real_estate(lot_type: str) -> bool:
 
 
 def parse_egrn_pdf(text: str) -> dict:
-    """Извлекает поля из текста выписки ЕГРН (PDF)."""
+    """Извлекает поля из текста выписки ЕГРН (PDF/OCR)."""
     result = {
         "cadastral": "", "address": "", "area": "",
-        "owner": "", "encumbrances": "", "summary": "",
+        "owner": "", "encumbrances": "", "share": "", "arrests": "",
+        "summary": "", "parsed_ok": False,
     }
     if not text or len(text) < 80:
         return result
-    kad = re.search(r"\b(\d{2}:\d{2}:\d{6,7}:\d+)\b", text)
+    # нормализация OCR-артефактов
+    norm = re.sub(r"[ \t]+", " ", text)
+    norm = re.sub(r"\n{3,}", "\n\n", norm)
+
+    kad = re.search(r"\b(\d{2}:\d{2}:\d{6,7}:\d+)\b", norm)
     if kad:
         result["cadastral"] = kad.group(1)
+
     for pat in [
-        r"(?:местоположени[ея]|адрес(?:\(местоположение\))?)[:;\s]+([^\n]{15,200})",
-        r"(?:находится по адресу)[:;\s]+([^\n]{15,200})",
+        r"(?:местоположени[ея]|адрес(?:\(местоположение\))?)[:;\s]+([^\n]{15,220})",
+        r"(?:находится по адресу)[:;\s]+([^\n]{15,220})",
+        r"Адрес[:\s]+([^\n]{15,220})",
     ]:
-        m = re.search(pat, text, re.IGNORECASE)
+        m = re.search(pat, norm, re.IGNORECASE)
         if m:
             addr = re.sub(r"\s{2,}", " ", m.group(1).strip())
-            result["address"] = addr[:150]
-            break
-    am = re.search(
-        r"площад[ьи][^\d]{0,30}(\d+[.,]?\d*)\s*(?:кв\.?\s*м|м²|кв\.м|кв\.?\s*м\.)",
-        text, re.IGNORECASE,
-    )
-    if am:
-        result["area"] = am.group(1).replace(",", ".") + " м²"
-    for pat in [
-        r"правообладател(?:ь|и)[:\s]+([^\n]{5,120})",
-        r"собственник[:\s]+([^\n]{5,120})",
-    ]:
-        m = re.search(pat, text, re.IGNORECASE)
-        if m:
-            val = m.group(1).strip()
-            if len(val) > 4 and not re.fullmatch(r"[\d\s]+", val):
-                result["owner"] = val[:100]
+            if len(addr) > 12:
+                result["address"] = addr[:180]
                 break
-    if re.search(r"нет зарегистрированных обремен|обременен.*не зарегистрир|без обремен|обременения отсутств", text, re.I):
+
+    for pat in [
+        r"площад[ьи][^\d]{0,40}(\d+[.,]?\d*)\s*(?:кв\.?\s*м|м²|кв\.м|кв\.?\s*м\.)",
+        r"(\d+[.,]?\d*)\s*(?:кв\.?\s*м|м²)\s*[\n—-]",
+    ]:
+        am = re.search(pat, norm, re.IGNORECASE)
+        if am:
+            result["area"] = am.group(1).replace(",", ".") + " м²"
+            break
+
+    # правообладатель / собственник
+    owner_block = ""
+    for pat in [
+        r"Сведения о правообладател[^\n]*\n([\s\S]{20,800}?)(?:\n\s*\d+\.\s|\nСведения о)",
+        r"правообладател(?:ь|и)[:\s]+([^\n]{5,160})",
+        r"собственник[:\s]+([^\n]{5,160})",
+    ]:
+        m = re.search(pat, norm, re.IGNORECASE)
+        if m:
+            owner_block = m.group(1).strip()
+            break
+    if owner_block:
+        # убираем тип записи, оставляем ФИО/наименование
+        lines = [ln.strip() for ln in owner_block.split("\n") if ln.strip()]
+        for ln in lines:
+            if re.search(r"(физическ|юридическ|гражданин|общество|банк|российской федерации)", ln, re.I):
+                continue
+            if len(ln) > 5 and not re.fullmatch(r"[\d\s:.-]+", ln):
+                result["owner"] = ln[:120]
+                break
+        if not result["owner"] and lines:
+            result["owner"] = lines[0][:120]
+
+    # доля
+    sm = re.search(
+        r"размер доли[:\s]+([^\n]{3,80})|"
+        r"(\d+/\d+)\s*(?:в праве|дол)",
+        norm, re.I,
+    )
+    if sm:
+        result["share"] = (sm.group(1) or sm.group(2) or "").strip()[:80]
+
+    # обременения / аресты
+    if re.search(
+        r"нет\s+зарегистрированных\s+обремен|"
+        r"обременени[яе]\s+не\s+зарегистрир|"
+        r"сведения\s+об\s+отсутствии\s+обремен",
+        norm, re.I,
+    ):
         result["encumbrances"] = "нет (по тексту ЕГРН)"
     else:
         enc = []
+        enc_section = re.search(
+            r"Сведения об ограничениях прав[^\n]*\n([\s\S]{20,1200}?)(?:\n\s*\d+\.\s|\nСведения о)",
+            norm, re.I,
+        )
+        src_enc = enc_section.group(1) if enc_section else norm
         for pat in [
-            r"вид\s+обременени[яь][:\s]+([^\n]{5,120})",
-            r"обременени[ея][:\s]+([^\n]{5,120})",
-            r"ограничени[ея]\s+прав[^\n]{0,20}([^\n]{5,120})",
+            r"вид\s+обременени[яь][:\s]+([^\n]{5,140})",
+            r"вид\s+ограничени[яь][:\s]+([^\n]{5,140})",
+            r"обременени[ея][:\s]+([^\n]{5,140})",
+            r"ипотек[^\n]{0,20}([^\n]{5,100})",
+            r"залог[^\n]{0,20}([^\n]{5,100})",
         ]:
-            for m in re.finditer(pat, text, re.IGNORECASE):
+            for m in re.finditer(pat, src_enc, re.IGNORECASE):
                 v = m.group(1).strip()
-                if v and v not in enc:
-                    enc.append(v[:80])
+                if v and v not in enc and len(v) > 4:
+                    enc.append(v[:90])
         if enc:
-            result["encumbrances"] = "; ".join(enc[:3])[:200]
-        elif re.search(r"ипотек|залог|арест", text, re.I):
-            result["encumbrances"] = "упоминаются в тексте ЕГРН"
+            result["encumbrances"] = "; ".join(enc[:4])[:240]
+        elif re.search(r"ипотек|залог|арест|сервитут|рента", norm, re.I):
+            result["encumbrances"] = "есть упоминания в тексте ЕГРН — проверить вручную"
+
+    if re.search(r"\barrest\b|арест\s|наложен\s+арест|запрещени[ея]\s+регистрац", norm, re.I):
+        am = re.search(r"(арест[^\n]{5,120}|запрещени[ея][^\n]{5,120})", norm, re.I)
+        result["arrests"] = (am.group(1).strip()[:120] if am else "упоминается в тексте ЕГРН")
+
     parts = []
     if result["cadastral"]:
         parts.append(f"кадастр {result['cadastral']}")
     if result["address"]:
-        parts.append(result["address"][:70])
+        parts.append(result["address"][:80])
     if result["area"]:
         parts.append(result["area"])
     if result["owner"]:
-        parts.append(f"правообладатель: {result['owner'][:50]}")
+        parts.append(f"собственник: {result['owner'][:60]}")
+    if result["share"]:
+        parts.append(f"доля: {result['share'][:40]}")
     if result["encumbrances"]:
-        parts.append(f"обременения: {result['encumbrances'][:50]}")
+        parts.append(f"обременения: {result['encumbrances'][:70]}")
+    if result["arrests"]:
+        parts.append(f"аресты: {result['arrests'][:50]}")
     result["summary"] = " | ".join(parts)
+    result["parsed_ok"] = bool(
+        result["cadastral"] or result["owner"] or result["encumbrances"] or result["address"]
+    )
     return result
 
 
+def format_egrn_legal_block(egrn: dict) -> str:
+    """Читаемый блок юридических данных из ЕГРН."""
+    if not egrn:
+        return ""
+    lines = []
+    if egrn.get("cadastral"):
+        lines.append(f"Кадастр: {egrn['cadastral']}")
+    if egrn.get("address"):
+        lines.append(f"Адрес: {egrn['address'][:100]}")
+    if egrn.get("area"):
+        lines.append(f"Площадь: {egrn['area']}")
+    if egrn.get("owner"):
+        lines.append(f"Собственник: {egrn['owner'][:100]}")
+    if egrn.get("share"):
+        lines.append(f"Доля: {egrn['share']}")
+    if egrn.get("encumbrances"):
+        lines.append(f"Обременения: {egrn['encumbrances'][:160]}")
+    if egrn.get("arrests"):
+        lines.append(f"Аресты: {egrn['arrests'][:120]}")
+    return "\n".join(lines)
+
+
 def apply_egrn_to_lot(lot: dict, pdf_text: str, from_real_pdf: bool) -> None:
-    """Парсит ЕГРН и дополняет lot; from_real_pdf=False — не считаем «документы проверены»."""
+    """Парсит ЕГРН и дополняет lot."""
     lot["pdf_from_egrn"] = from_real_pdf
     if from_real_pdf:
         lot["egrn_pdf_text"] = pdf_text
-    egrn = parse_egrn_pdf(pdf_text) if from_real_pdf else {}
-    lot["egrn_parsed"] = egrn
-    if from_real_pdf:
         lot["pdf_text"] = pdf_text
+    egrn = parse_egrn_pdf(pdf_text) if from_real_pdf and pdf_text else {}
+    lot["egrn_parsed"] = egrn
+    if from_real_pdf and egrn.get("parsed_ok"):
+        lot["egrn_read_ok"] = True
     if egrn.get("cadastral") and not lot.get("cadastral"):
         lot["cadastral"] = egrn["cadastral"]
     if egrn.get("address") and not lot.get("address"):
@@ -314,11 +397,20 @@ def apply_egrn_to_lot(lot: dict, pdf_text: str, from_real_pdf: bool) -> None:
 
 
 def resolve_document_status(lot: dict) -> str:
-    """Единый статус документов — одно значение на весь лот."""
-    if lot.get("pdf_from_egrn") and lot.get("egrn_pdf_text"):
-        return "Документы проверены (ЕГРН)"
+    """Единый статус документов — без выдумок."""
+    egrn = lot.get("egrn_parsed") or {}
+    if lot.get("egrn_read_ok") or (lot.get("pdf_from_egrn") and egrn.get("parsed_ok")):
+        method = lot.get("egrn_extract_method", "")
+        suffix = " (OCR)" if method == "ocr" else ""
+        return f"Документы проверены (ЕГРН{suffix})"
+    if lot.get("egrn_ocr_failed"):
+        return "не удалось распознать выписку ЕГРН"
     if lot.get("pdf_download_failed"):
-        return "PDF есть, не прочитан"
+        if lot.get("has_egrn_on_site"):
+            return "выписка на сайте — не удалось скачать (нужна авторизация)"
+        return "документы не получены"
+    if lot.get("has_egrn_on_site"):
+        return "выписка на сайте — текст не извлечён"
     return "Документы не получены"
 
 
@@ -395,6 +487,8 @@ def format_price_line(an: dict) -> str:
         return f"💰 {price} | _рынок не определён — оценить вручную_"
     disc = an.get("discount_pct", "0")
     disc_s = f" (-{disc}%)" if str(disc) not in ("0", "?", "") else ""
+    if an.get("market_source") == "search":
+        return f"💰 {price} → ориентир {an.get('market_price', '—')}{disc_s} _проверить_"
     return f"💰 {price} → рынок {an.get('market_price', '—')}{disc_s}"
 
 
@@ -436,7 +530,7 @@ def detect_type(text: str) -> str:
 
 async def download_pdf(lot_id: str) -> str:
     try:
-        import pdfplumber
+        from egrn_pdf import extract_pdf_text
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
             "Referer":    "https://tbankrot.ru/",
@@ -452,15 +546,13 @@ async def download_pdf(lot_id: str) -> str:
             for url in pdf_urls:
                 try:
                     resp = await client.get(url, headers=headers)
-                    if resp.status_code == 200 and b'%PDF' in resp.content[:10]:
-                        with pdfplumber.open(io.BytesIO(resp.content)) as pdf:
-                            text = "\n".join(
-                                p.extract_text() or "" for p in pdf.pages[:5]
-                            )[:5000]
-                            if text and len(text) > 100:
-                                print(f"    📄 PDF скачан ({len(text)} симв.)")
-                                return text
-                except: continue
+                    if resp.status_code == 200 and b"%PDF" in resp.content[:10]:
+                        text, method = extract_pdf_text(resp.content)
+                        if text and len(text) > 80:
+                            print(f"    📄 PDF ({method}, {len(text)} симв.)")
+                            return text
+                except Exception:
+                    continue
     except Exception as e:
         print(f"    PDF error: {e}")
     return ""
@@ -517,6 +609,9 @@ async def get_lot_details(url: str, page, light: bool = False) -> dict:
         except: pass
         text = await page.inner_text("body")
         details["description"] = text[:4000]
+        tl = text.lower()
+        if any(x in tl for x in ("егрн", "egrn", "выписк", "выписка егрн")):
+            details["has_egrn_on_site"] = True
         for pat in [r'начальн[^\d]*(\d[\d\s]{3,})\s*(?:руб|₽)',
                     r'(\d[\d\s]{4,})\s*(?:руб|₽)',
                     r'цена[^\d]*(\d[\d\s]{3,})']:
@@ -907,9 +1002,42 @@ async def analyze_lot(lot: dict, light: bool = False) -> dict:
             "area": 0, "comment": "оценить рынок авто вручную",
             "manual_market": True,
         }
+    elif light:
+        mkt = {
+            "market_price": 0, "manual_market": True,
+            "comment": "", "area": lot.get("area_sqm") or 0,
+        }
     else:
-        src_area = f"{title} {page_text} {egrn_pdf}"
-        mkt = calc_market_price(lot_type, title, region, src_area)
+        from market_search import fetch_market_orientir
+        area_sqm = lot.get("area_sqm") or 0
+        if not area_sqm:
+            src_area = f"{title} {page_text} {egrn_pdf}"
+            am = re.search(r"(\d+[.,]?\d*)\s*(?:м²|кв\.?\s*м)", src_area, re.I)
+            if am:
+                try:
+                    area_sqm = float(am.group(1).replace(",", "."))
+                except ValueError:
+                    area_sqm = 0
+        orient = await fetch_market_orientir(
+            lot_type, lot.get("address", ""), area_sqm, region, title,
+        )
+        if orient.get("found"):
+            mkt = {
+                "market_price": orient["market_price"],
+                "rental_monthly": 0,
+                "price_per_sqm": orient.get("price_per_sqm", 0),
+                "area": area_sqm,
+                "comment": orient["comment"],
+                "manual_market": False,
+                "market_source": "search",
+            }
+        else:
+            mkt = {
+                "market_price": 0, "rental_monthly": 0, "price_per_sqm": 0,
+                "area": area_sqm,
+                "comment": orient.get("comment", "рынок не определён"),
+                "manual_market": True,
+            }
     mkt_prc = mkt["market_price"]
     market_known = not mkt.get("manual_market") and mkt_prc > 0
 
@@ -921,18 +1049,22 @@ async def analyze_lot(lot: dict, light: bool = False) -> dict:
             mkt_prc = 0
             market_known = False
 
-    has_pdf = lot.get("pdf_from_egrn") and len(egrn_pdf) > 100
+    has_pdf = bool(lot.get("egrn_read_ok"))
     document_status = resolve_document_status(lot)
     egrn_parsed = lot.get("egrn_parsed") or {}
+    has_pdf = has_pdf or bool(egrn_parsed.get("parsed_ok"))
 
     if lot_type == "авто":
         legal_text = ""
         encumb_from_egrn = ""
-    elif egrn_parsed.get("summary"):
-        legal_text = egrn_parsed["summary"]
+    elif egrn_parsed.get("parsed_ok"):
+        legal_text = format_egrn_legal_block(egrn_parsed)
         encumb_from_egrn = egrn_parsed.get("encumbrances", "")
-    elif has_pdf:
-        legal_text = "ЕГРН получен — ключевые поля не распознаны автоматически"
+    elif lot.get("egrn_ocr_failed"):
+        legal_text = ""
+        encumb_from_egrn = ""
+    elif lot.get("pdf_from_egrn") and egrn_pdf:
+        legal_text = "ЕГРН скачан — ключевые поля не распознаны"
         encumb_from_egrn = ""
     else:
         legal_text = ""
@@ -1082,9 +1214,11 @@ async def analyze_lot(lot: dict, light: bool = False) -> dict:
         "market_price": fmt(mkt_prc, is_market=True) if market_known else "не определён",
         "land_manual_market": mkt.get("manual_market", False),
         "market_known": market_known,
+        "market_source": mkt.get("market_source", ""),
         "discount_pct": str(disc_pct) if market_known and disc_pct > 0 else "?",
         "lot_type": lot_type,
     }
+    discount_ok = market_known and disc_pct >= MIN_DISCOUNT_PCT
 
     return {
         "lot_type":       lot_type,
@@ -1093,8 +1227,11 @@ async def analyze_lot(lot: dict, light: bool = False) -> dict:
         "price":          an_stub["price"],
         "market_price":   an_stub["market_price"],
         "market_known":   market_known,
-        "market_comment": mkt.get("comment", "") if not market_known else mkt.get("comment", ""),
+        "market_source":  mkt.get("market_source", ""),
+        "market_comment": mkt.get("comment", ""),
         "discount_pct":   an_stub["discount_pct"],
+        "discount_ok":    discount_ok,
+        "qualifies_hot":  discount_ok and score >= 7.0,
         "lot_price_raw":  lot_price,
         "market_price_raw": mkt_prc if market_known else 0,
         "price_line":     format_price_line(an_stub),
