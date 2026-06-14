@@ -1,6 +1,7 @@
-# v2.0 — Bankrot Bot with regions
+# v2.1 — расписание + /latest + стриминг при ручном запуске
 import asyncio, os, re, logging
-from datetime import datetime
+from datetime import datetime, time
+from zoneinfo import ZoneInfo
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
 from dotenv import load_dotenv
@@ -18,6 +19,8 @@ GH_TOKEN = os.getenv("GITHUB_TOKEN", "")
 
 # Кэш спарсенных лотов (кадастр, адрес, дата) для «Полного анализа»
 lot_cache = {}
+_run_lock = asyncio.Lock()
+MSK = ZoneInfo("Europe/Moscow")
 
 # Все регионы Т-Банкрот
 REGIONS = {
@@ -40,6 +43,7 @@ REGIONS = {
 
 def main_menu():
     return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📋 Последние результаты", callback_data="latest")],
         [InlineKeyboardButton("🚀 Запустить анализ", callback_data="menu_run")],
         [InlineKeyboardButton("🗺 Выбрать регион",   callback_data="menu_regions")],
         [
@@ -68,28 +72,109 @@ def regions_menu():
     rows.append([InlineKeyboardButton("↩️ Назад", callback_data="back_menu")])
     return InlineKeyboardMarkup(rows)
 
-async def trigger_workflow(category: str = "все", region: str = "moskva") -> bool:
-    import httpx
-    token = os.getenv("GITHUB_TOKEN", "")
-    if not token:
-        print("GITHUB_TOKEN not found in environment")
-        return False
+async def show_latest(update: Update, *, edit_message=None):
+    """Показать снимок последнего прогона из БД — без нового запуска."""
+    from database import get_latest_run, format_latest_run_messages
+    run = get_latest_run()
+    chat_id = update.effective_chat.id
+    bot = update.get_bot()
+
+    async def _reply(text, **kw):
+        if edit_message:
+            await edit_message.edit_text(text, **kw)
+            edit_message = None
+        else:
+            await bot.send_message(chat_id=chat_id, text=text, **kw)
+
+    if not run:
+        text = (
+            "📋 *Последних результатов пока нет.*\n\n"
+            "Автопрогоны: *08:00* и *19:00* (МСК).\n"
+            "Или нажмите «Запустить анализ» — горячие лоты придут по ходу."
+        )
+        if edit_message:
+            await edit_message.edit_text(text, parse_mode="Markdown", reply_markup=main_menu())
+        else:
+            await bot.send_message(chat_id=chat_id, text=text, parse_mode="Markdown", reply_markup=main_menu())
+        return
+
+    parts = format_latest_run_messages(run)
+    if edit_message:
+        await edit_message.edit_text(parts[0], parse_mode="Markdown", disable_web_page_preview=True)
+        for part in parts[1:]:
+            await bot.send_message(chat_id=chat_id, text=part, parse_mode="Markdown", disable_web_page_preview=True)
+    else:
+        for part in parts:
+            await bot.send_message(chat_id=chat_id, text=part, parse_mode="Markdown", disable_web_page_preview=True)
+    await bot.send_message(chat_id=chat_id, text="📱 Меню:", reply_markup=main_menu())
+
+
+async def cmd_latest(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await show_latest(update)
+
+
+async def _run_agent_background(chat_id: str, cats, hot_only: bool, bot, label: str):
+    from agent import run as agent_run
+    stream_min = 9.0 if hot_only else 8.0
     try:
-        async with httpx.AsyncClient(timeout=15) as client:
-            resp = await client.post(
-                "https://api.github.com/repos/tagirdancer/bankrot-agent/actions/workflows/agent.yml/dispatches",
-                headers={
-                    "Authorization": f"token {token}",
-                    "Accept": "application/vnd.github.v3+json",
-                    "X-GitHub-Api-Version": "2022-11-28",
-                },
-                json={"ref": "main", "inputs": {"category": category}}
+        async with _run_lock:
+            await agent_run(
+                cats=cats,
+                include_extra=True,
+                daily=True,
+                save_to_db=True,
+                run_type="manual",
+                stream_chat_id=str(chat_id),
+                stream_bot=bot,
+                stream_min_score=stream_min,
+                hot_only=hot_only,
             )
-            print(f"GitHub API status: {resp.status_code}")
-            return resp.status_code == 204
-    except Exception as e:
-        print(f"GitHub API error: {e}")
-        return False
+        await bot.send_message(
+            chat_id=chat_id,
+            text=(
+                f"✅ *Прогон завершён* — {label}\n\n"
+                f"📋 /latest — полный снимок без ожидания\n"
+                f"⏰ Следующий автопрогон: 08:00 или 19:00 МСК"
+            ),
+            parse_mode="Markdown",
+            reply_markup=main_menu(),
+        )
+    except Exception:
+        log.exception("manual agent run failed")
+        await bot.send_message(
+            chat_id=chat_id,
+            text="⚠️ Прогон прерван с ошибкой. Попробуйте позже или /latest для прошлого снимка.",
+            reply_markup=main_menu(),
+        )
+
+
+def _cats_for_run(cat: str):
+    from agent import DEFAULT_CATS
+    if cat in ("full", "hot", "все"):
+        return DEFAULT_CATS, cat == "hot"
+    return {cat}, False
+
+
+async def scheduled_agent_job(ctx: ContextTypes.DEFAULT_TYPE):
+    """Автопрогон по расписанию (08:00 / 19:00 МСК)."""
+    if _run_lock.locked():
+        log.warning("scheduled agent skipped — already running")
+        return
+    slot = (ctx.job.data or {}).get("slot", "?")
+    log.info("scheduled agent start %s", slot)
+    try:
+        from agent import run as agent_run, DEFAULT_CATS
+        async with _run_lock:
+            await agent_run(
+                cats=DEFAULT_CATS,
+                include_extra=True,
+                daily=True,
+                save_to_db=True,
+                run_type="scheduled",
+            )
+        log.info("scheduled agent done %s", slot)
+    except Exception:
+        log.exception("scheduled agent failed %s", slot)
 
 async def ask_expert(question: str) -> str:
     import httpx
@@ -227,7 +312,8 @@ user_region = {}
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "👋 *Банкротный агент*\n\n"
-        "Анализирует лоты с Т-Банкрот и отправляет дайджест\n\n"
+        "Автопрогоны: *08:00* и *19:00* (МСК)\n"
+        "📋 /latest — готовые результаты без ожидания\n\n"
         "Выберите действие:",
         parse_mode="Markdown",
         reply_markup=main_menu()
@@ -348,6 +434,11 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await q.message.reply_text("\u26a0\ufe0f Не удалось получить анализ (внутренняя ошибка). Подробности в логах Railway.")
         return
 
+    if data == "latest":
+        await q.answer()
+        await show_latest(update, edit_message=q.message)
+        return
+
     await q.answer()
     chat = str(q.message.chat_id)
 
@@ -381,7 +472,11 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         region_name = next((k for k,v in REGIONS.items() if v == region), region)
         if data == "status":
             await q.edit_message_text(
-                f"📊 *Статус*\n\nРегион: *{region_name}*\nДайджест: каждый день в 08:00\nАгент: работает в GitHub Actions",
+                f"📊 *Статус*\n\n"
+                f"Регион: *{region_name}*\n"
+                f"Автопрогоны: *08:00* и *19:00* (МСК)\n"
+                f"📋 /latest — последний снимок из базы\n"
+                f"🚀 Ручной запуск — горячие лоты по мере нахождения",
                 parse_mode="Markdown",
                 reply_markup=main_menu()
             )
@@ -416,32 +511,32 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "дом":"дома","земля":"земля","авто":"авто","hot":"горячие 9+",
         }
         label = cat_names.get(cat, cat)
-        github_cat = "все" if cat in ("full","hot") else cat
+        cats, hot_only = _cats_for_run(cat)
 
-        ok = await trigger_workflow(github_cat, region)
-        if ok:
+        if _run_lock.locked():
             await q.edit_message_text(
-                f"🚀 *Анализ запущен!*\n\n"
-                f"📂 Категория: *{label}*\n"
-                f"📍 Регион: *{region_name}*\n\n"
-                f"⏳ ~30 минут — результаты придут в этот чат\n"
-                f"_Агент работает в GitHub Actions_",
+                "⏳ *Уже идёт прогон*\n\n"
+                "Горячие лоты приходят по мере нахождения.\n"
+                "📋 /latest — прошлый готовый снимок",
                 parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup([[
-                    InlineKeyboardButton("↩️ Меню", callback_data="back_menu")
-                ]])
+                reply_markup=main_menu(),
             )
-        else:
-            await q.edit_message_text(
-                f"⚠️ *GITHUB TOKEN не настроен*\n\n"
-                f"Зайдите вручную:\n"
-                f"github.com/tagirdancer/bankrot-agent/actions\n"
-                f"→ Run workflow",
-                parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup([[
-                    InlineKeyboardButton("↩️ Меню", callback_data="back_menu")
-                ]])
-            )
+            return
+
+        await q.edit_message_text(
+            f"🚀 *Анализ запущен!*\n\n"
+            f"📂 Категория: *{label}*\n"
+            f"📍 Регион: *{region_name}*\n\n"
+            f"⚡ Лоты ≥8 баллов — *сразу*, по мере просмотра (~2–5 мин)\n"
+            f"📦 Полный дайджест — в конце (~30–45 мин)\n"
+            f"📋 /latest — не ждать, открыть прошлый снимок",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("📋 Последние результаты", callback_data="latest"),
+                InlineKeyboardButton("↩️ Меню", callback_data="back_menu"),
+            ]]),
+        )
+        asyncio.create_task(_run_agent_background(chat, cats, hot_only, ctx.bot, label))
 
 async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     text = update.message.text or ""
@@ -497,10 +592,24 @@ def run():
     app.add_handler(CommandHandler("menu",  cmd_menu))
     app.add_handler(CommandHandler("m",     cmd_menu))
     app.add_handler(CommandHandler("saved", cmd_saved))
+    app.add_handler(CommandHandler("latest", cmd_latest))
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     if app.job_queue:
+        app.job_queue.run_daily(
+            scheduled_agent_job,
+            time=time(hour=8, minute=0, tzinfo=MSK),
+            data={"slot": "08:00"},
+            name="agent_morning",
+        )
+        app.job_queue.run_daily(
+            scheduled_agent_job,
+            time=time(hour=19, minute=0, tzinfo=MSK),
+            data={"slot": "19:00"},
+            name="agent_evening",
+        )
         app.job_queue.run_repeating(check_reminders, interval=3600, first=120)
+        log.info("Scheduled agent jobs: 08:00 and 19:00 MSK")
     else:
         log.warning("JobQueue недоступен — напоминания /saved отключены (нужен python-telegram-bot[job-queue])")
     print("Bot started!")
