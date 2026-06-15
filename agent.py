@@ -506,7 +506,15 @@ async def _try_lot_pdfs(lot, page, ctx):
                     and "егрн" not in title.lower()
                 )
                 if is_appr:
-                    text, method = extract_appraisal_pdf_text(raw)
+                    try:
+                        text, method = extract_appraisal_pdf_text(raw)
+                        log.info(
+                            "appraisal OCR: %d chars, method=%s title=%r",
+                            len(text or ""), method, title[:60],
+                        )
+                    except Exception:
+                        log.exception("appraisal OCR failed title=%r", title[:60])
+                        text, method = "", "failed"
                     if len(text or "") < 80:
                         text2, method2 = extract_appraisal_pdf_text(raw)
                         if len(text2 or "") > len(text or ""):
