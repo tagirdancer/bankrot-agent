@@ -20,22 +20,26 @@ def extract_pdf_text(raw: bytes, max_pages: int = 8) -> tuple[str, str]:
       - method='ocr'  — распознано со скана
       - method='failed' — не удалось
     """
-    if not raw or b"%PDF" not in raw[:10]:
+    try:
+        if not raw or b"%PDF" not in raw[:10]:
+            return "", "failed"
+
+        text = _extract_with_pdfplumber(raw, max_pages)
+        if len(text) >= MIN_TEXT_LEN:
+            return text[:12000], "text"
+
+        text = _extract_with_pymupdf(raw, max_pages)
+        if len(text) >= MIN_TEXT_LEN:
+            return text[:12000], "text"
+
+        ocr_text = _ocr_pdf(raw, min(max_pages, MAX_OCR_PAGES))
+        if len(ocr_text) >= MIN_TEXT_LEN:
+            return ocr_text[:12000], "ocr"
+
+        return (text or ocr_text or "").strip(), "failed"
+    except Exception as e:
+        log.warning("extract_pdf_text failed: %s", e)
         return "", "failed"
-
-    text = _extract_with_pdfplumber(raw, max_pages)
-    if len(text) >= MIN_TEXT_LEN:
-        return text[:12000], "text"
-
-    text = _extract_with_pymupdf(raw, max_pages)
-    if len(text) >= MIN_TEXT_LEN:
-        return text[:12000], "text"
-
-    ocr_text = _ocr_pdf(raw, min(max_pages, MAX_OCR_PAGES))
-    if len(ocr_text) >= MIN_TEXT_LEN:
-        return ocr_text[:12000], "ocr"
-
-    return (text or ocr_text or "").strip(), "failed"
 
 
 def _extract_with_pdfplumber(raw: bytes, max_pages: int) -> str:
