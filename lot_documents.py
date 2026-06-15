@@ -56,6 +56,8 @@ def discover_lot_documents(html: str, lot_id: str) -> list[dict]:
             return
         if not _is_document_url(url, title):
             return
+        if "get_doc.php" in url.lower() or "doc_template" in url.lower():
+            return
         seen_urls.add(url)
         docs.append({
             "url": url,
@@ -77,13 +79,6 @@ def discover_lot_documents(html: str, lot_id: str) -> list[dict]:
         html, re.I,
     ):
         add(m.group(0), "")
-
-    # get_doc.php шаблоны (если есть в блоке документов)
-    for m in re.finditer(
-        r'get_doc\.php\?[^"\']+',
-        html, re.I,
-    ):
-        add(_norm_url(m.group(0)), f"шаблон {lot_id}")
 
     return docs
 
@@ -120,6 +115,8 @@ def classify_document(title: str, url: str, text: str, ext: str) -> str:
 
     if re.search(r"инф\.?\s*сообщ|информационн[^\n]{0,20}сообщ", blob):
         return "info_message"
+    if re.search(r"выписк[^\n]{0,30}отч[её]т|отч[её]т", blob) and "егрн" not in blob:
+        return "appraisal"
     if re.search(r"егрн|выписк[^\n]{0,40}егрн", blob):
         return "egrn"
     if re.search(r"оцен|отч[её]т[^\n]{0,30}оцен", blob):
@@ -156,9 +153,34 @@ def extract_docx_text(raw: bytes) -> tuple[str, str]:
         text = "\n".join(parts).strip()
         if len(text) >= 40:
             return text[:20000], "docx"
+    except ImportError:
+        text = _extract_docx_via_zip(raw)
+        if len(text) >= 40:
+            return text[:20000], "docx_zip"
     except Exception as e:
         log.warning("docx extract failed: %s", e)
+        text = _extract_docx_via_zip(raw)
+        if len(text) >= 40:
+            return text[:20000], "docx_zip"
     return "", "failed"
+
+
+def _extract_docx_via_zip(raw: bytes) -> str:
+    """Fallback без python-docx: читаем word/document.xml."""
+    import zipfile
+    import xml.etree.ElementTree as ET
+    try:
+        with zipfile.ZipFile(io.BytesIO(raw)) as zf:
+            xml = zf.read("word/document.xml")
+        root = ET.fromstring(xml)
+        ns = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
+        parts = []
+        for node in root.iter("{http://schemas.openxmlformats.org/wordprocessingml/2006/main}t"):
+            if node.text and node.text.strip():
+                parts.append(node.text.strip())
+        return re.sub(r"\s+", " ", " ".join(parts)).strip()
+    except Exception:
+        return ""
 
 
 def parse_contract_text(text: str) -> dict[str, Any]:
