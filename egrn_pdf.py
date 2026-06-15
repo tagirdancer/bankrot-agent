@@ -1,25 +1,33 @@
 """
-Извлечение текста из PDF выписки ЕГРН: текстовый слой + OCR для сканов.
+Извлечение текста из PDF: текстовый слой + OCR для сканов (ЕГРН, отчёты об оценке).
 """
 from __future__ import annotations
 
 import io
 import logging
 import re
+import shutil
 
 log = logging.getLogger("egrn_pdf")
 
 MIN_TEXT_LEN = 80
 MAX_OCR_PAGES = 6
+MAX_APPRAISAL_OCR_PAGES = 22
+MAX_APPRAISAL_TEXT = 35000
+
+
+def ocr_available() -> bool:
+    try:
+        import fitz  # noqa: F401
+        import pytesseract  # noqa: F401
+        from PIL import Image  # noqa: F401
+    except ImportError:
+        return False
+    return bool(shutil.which("tesseract"))
 
 
 def extract_pdf_text(raw: bytes, max_pages: int = 8) -> tuple[str, str]:
-    """
-    Возвращает (text, method):
-      - method='text' — текстовый слой PDF
-      - method='ocr'  — распознано со скана
-      - method='failed' — не удалось
-    """
+    """ЕГРН и прочие PDF: text → pymupdf → OCR (до 6 стр.)."""
     try:
         if not raw or b"%PDF" not in raw[:10]:
             return "", "failed"
@@ -32,13 +40,47 @@ def extract_pdf_text(raw: bytes, max_pages: int = 8) -> tuple[str, str]:
         if len(text) >= MIN_TEXT_LEN:
             return text[:12000], "text"
 
-        ocr_text = _ocr_pdf(raw, min(max_pages, MAX_OCR_PAGES))
+        ocr_text = _ocr_pdf(raw, min(max_pages, MAX_OCR_PAGES), dpi=2.0)
         if len(ocr_text) >= MIN_TEXT_LEN:
             return ocr_text[:12000], "ocr"
 
         return (text or ocr_text or "").strip(), "failed"
     except Exception as e:
         log.warning("extract_pdf_text failed: %s", e)
+        return "", "failed"
+
+
+def extract_appraisal_pdf_text(raw: bytes) -> tuple[str, str]:
+    """
+    Отчёт об оценке (часто скан): агрессивный OCR до 22 стр., DPI 2.5.
+    """
+    try:
+        if not raw or b"%PDF" not in raw[:10]:
+            return "", "failed"
+
+        if not ocr_available():
+            log.warning("OCR unavailable (tesseract/pymupdf/pytesseract)")
+
+        for max_p, label in ((12, "text12"), (MAX_APPRAISAL_OCR_PAGES, "text22")):
+            text = _extract_with_pdfplumber(raw, max_p)
+            if len(text) >= MIN_TEXT_LEN:
+                log.info("appraisal PDF text layer: %d chars (%s)", len(text), label)
+                return text[:MAX_APPRAISAL_TEXT], "text"
+
+        text = _extract_with_pymupdf(raw, MAX_APPRAISAL_OCR_PAGES)
+        if len(text) >= MIN_TEXT_LEN:
+            log.info("appraisal PDF pymupdf: %d chars", len(text))
+            return text[:MAX_APPRAISAL_TEXT], "text"
+
+        ocr_text = _ocr_pdf(raw, MAX_APPRAISAL_OCR_PAGES, dpi=2.5)
+        if len(ocr_text) >= 60:
+            log.info("appraisal PDF OCR: %d chars, tesseract=%s", len(ocr_text), ocr_available())
+            return ocr_text[:MAX_APPRAISAL_TEXT], "ocr"
+
+        partial = (text or ocr_text or "").strip()
+        return partial, "failed" if len(partial) < 60 else "ocr_partial"
+    except Exception as e:
+        log.warning("extract_appraisal_pdf_text failed: %s", e)
         return "", "failed"
 
 
@@ -55,7 +97,7 @@ def _extract_with_pdfplumber(raw: bytes, max_pages: int) -> str:
 
 def _extract_with_pymupdf(raw: bytes, max_pages: int) -> str:
     try:
-        import fitz  # pymupdf
+        import fitz
         doc = fitz.open(stream=raw, filetype="pdf")
         parts = [doc[i].get_text() for i in range(min(len(doc), max_pages))]
         doc.close()
@@ -65,7 +107,7 @@ def _extract_with_pymupdf(raw: bytes, max_pages: int) -> str:
         return ""
 
 
-def _ocr_pdf(raw: bytes, max_pages: int) -> str:
+def _ocr_pdf(raw: bytes, max_pages: int, dpi: float = 2.0) -> str:
     try:
         import fitz
         import pytesseract
@@ -74,17 +116,24 @@ def _ocr_pdf(raw: bytes, max_pages: int) -> str:
         log.warning("OCR deps missing: %s", e)
         return ""
 
+    if not shutil.which("tesseract"):
+        log.warning("tesseract binary not found in PATH")
+        return ""
+
+    scale = dpi
     parts = []
     try:
         doc = fitz.open(stream=raw, filetype="pdf")
-        for i in range(min(len(doc), max_pages)):
+        n = min(len(doc), max_pages)
+        for i in range(n):
             page = doc[i]
-            pix = page.get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False)
+            pix = page.get_pixmap(matrix=fitz.Matrix(scale, scale), alpha=False)
             img = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
             chunk = pytesseract.image_to_string(img, lang="rus+eng", config="--psm 6")
             if chunk.strip():
                 parts.append(chunk)
         doc.close()
+        log.debug("OCR processed %d pages, %d chars", n, len("\n".join(parts)))
     except Exception as e:
         log.warning("OCR failed: %s", e)
         return ""
