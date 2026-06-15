@@ -119,15 +119,21 @@ def _apply_details(lot, details):
         lot.update(parse_auto_meta(f"{lot['title']} {lot.get('description', '')}"))
 
 
-async def _confirm_login(page) -> tuple[bool, str]:
+async def _confirm_login(page, check_lot_wall: bool = True) -> tuple[bool, str]:
     """Проверка успешного входа."""
     if await page.locator("text=Выйти").count() > 0:
         return True, "logout_link_visible"
-    if await page.locator("a.button.stroke:text('Войти')").count() == 0:
-        if await page.locator("text=Выйти").count() == 0:
-            body = (await page.inner_text("body")).lower()
-            if "личный кабинет" in body or "мой профиль" in body:
-                return True, "profile_in_body"
+    try:
+        body = (await page.inner_text("body")).lower()
+    except Exception:
+        body = ""
+    if "личный кабинет" in body or "мой профиль" in body:
+        return True, "profile_in_body"
+    if await page.locator("a.button.stroke:text('Войти')").count() > 0:
+        if not check_lot_wall:
+            return False, "login_button_visible"
+    if not check_lot_wall:
+        return False, "not_logged_in"
     await page.goto("https://tbankrot.ru/item?id=7618864", timeout=35000, wait_until="domcontentloaded")
     await page.wait_for_timeout(2000)
     body = (await page.inner_text("body")).lower()
@@ -139,6 +145,81 @@ async def _confirm_login(page) -> tuple[bool, str]:
     if await page.locator("text=Выйти").count() > 0:
         return True, "logout_on_lot_page"
     return False, "login_wall_still_present"
+
+
+async def _read_login_hints(page) -> list[str]:
+    try:
+        return [
+            h.strip() for h in await page.locator(".login_form__hint").all_inner_texts()
+            if h and h.strip()
+        ]
+    except Exception:
+        return []
+
+
+async def _do_login_submit(page) -> tuple[bool, str]:
+    """Отправка login через #login-btn и ожидание ответа /script/ajax.php."""
+    if await page.locator("#lg-captcha").count() > 0:
+        try:
+            if await page.locator("#lg-captcha").is_visible():
+                return False, "captcha_required"
+        except Exception:
+            pass
+
+    try:
+        async with page.expect_response(
+            lambda r: "/script/ajax.php" in r.url and r.request.method == "POST",
+            timeout=20000,
+        ) as resp_info:
+            clicked = await _submit_login_form(page)
+            if not clicked:
+                await page.locator("#login-btn").click(timeout=5000)
+        resp = await resp_info.value
+        body = (await resp.text()).strip()
+        log.info("[login] ajax response: %r", body[:120])
+        if body == "success":
+            await page.reload(wait_until="domcontentloaded")
+            await page.wait_for_timeout(2500)
+            return True, "ajax_success"
+        hints = {
+            "badMail": "invalid_email",
+            "badPas": "invalid_password",
+            "badAuth": "bad_credentials",
+            "tooMany": "rate_limited",
+            "badCaptcha": "bad_captcha",
+            "notCaptcha": "captcha_reload_needed",
+        }
+        ui_hints = await _read_login_hints(page)
+        if ui_hints:
+            log.warning("[login] form hints: %s", ui_hints)
+        return False, hints.get(body, f"ajax:{body}")
+    except Exception as e:
+        log.warning("[login] ajax wait failed: %s — trying fetch fallback", e)
+
+    try:
+        result = await page.evaluate(
+            """async (cred) => {
+                const fd = new URLSearchParams();
+                fd.set('key', 'login');
+                fd.set('mail', cred.mail);
+                fd.set('pas', cred.pas);
+                fd.set('captcha', document.getElementById('lg-captcha')?.value || '');
+                fd.set('captcha_token', document.querySelector('input[name=captcha_token]')?.value || '');
+                const r = await fetch('/script/ajax.php', {method:'POST', body: fd, credentials:'include'});
+                return {body: (await r.text()).trim(), status: r.status};
+            }""",
+            {"mail": LOGIN, "pas": PASSWORD},
+        )
+        body = (result or {}).get("body", "")
+        log.info("[login] fetch fallback response: %r", body[:120])
+        if body == "success":
+            await page.reload(wait_until="domcontentloaded")
+            await page.wait_for_timeout(2500)
+            return True, "fetch_success"
+        return False, f"fetch:{body or 'empty'}"
+    except Exception:
+        log.exception("[login] fetch fallback failed")
+        return False, "fetch_failed"
 
 
 async def _submit_login_form(page) -> str:
@@ -197,7 +278,7 @@ async def login(page) -> bool:
     try:
         await page.goto("https://tbankrot.ru/", timeout=45000, wait_until="domcontentloaded")
         await page.wait_for_timeout(2000)
-        ok, reason = await _confirm_login(page)
+        ok, reason = await _confirm_login(page, check_lot_wall=False)
         if ok:
             log.info("[login] OK — already logged in (%s)", reason)
             return True
@@ -251,18 +332,17 @@ async def login(page) -> bool:
             log.warning("[login] password field not found")
             return False
 
-        submit_via = await _submit_login_form(page)
-        if not submit_via:
-            log.warning("[login] submit button not found")
+        submit_ok, submit_reason = await _do_login_submit(page)
+        if not submit_ok:
+            log.warning("[login] submit failed: %s", submit_reason)
         else:
-            log.info("[login] form submitted via %s", submit_via)
+            log.info("[login] form submitted OK (%s)", submit_reason)
 
-        await page.wait_for_timeout(4500)
-        ok, reason = await _confirm_login(page)
+        ok, reason = await _confirm_login(page, check_lot_wall=True)
         if ok:
-            log.info("[login] OK — %s (submit=%s)", reason, submit_via or "none")
+            log.info("[login] OK — %s (submit=%s)", reason, submit_reason)
         else:
-            log.warning("[login] NOT CONFIRMED — %s (submit=%s)", reason, submit_via or "none")
+            log.warning("[login] NOT CONFIRMED — %s (submit=%s)", reason, submit_reason)
         return ok
     except Exception:
         log.exception("[login] FAIL")
