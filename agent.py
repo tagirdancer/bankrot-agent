@@ -119,6 +119,74 @@ def _apply_details(lot, details):
         lot.update(parse_auto_meta(f"{lot['title']} {lot.get('description', '')}"))
 
 
+async def _confirm_login(page) -> tuple[bool, str]:
+    """Проверка успешного входа."""
+    if await page.locator("text=Выйти").count() > 0:
+        return True, "logout_link_visible"
+    if await page.locator("a.button.stroke:text('Войти')").count() == 0:
+        if await page.locator("text=Выйти").count() == 0:
+            body = (await page.inner_text("body")).lower()
+            if "личный кабинет" in body or "мой профиль" in body:
+                return True, "profile_in_body"
+    await page.goto("https://tbankrot.ru/item?id=7618864", timeout=35000, wait_until="domcontentloaded")
+    await page.wait_for_timeout(2000)
+    body = (await page.inner_text("body")).lower()
+    if "войдите или зарегистрируйтесь" not in body and "для просмотра полной информации" not in body:
+        if await page.locator("text=Выйти").count() > 0:
+            return True, "lot_page_full_access"
+        if re.search(r"\.pdf|егрн|выписк", body):
+            return True, "lot_page_has_docs_hint"
+    if await page.locator("text=Выйти").count() > 0:
+        return True, "logout_on_lot_page"
+    return False, "login_wall_still_present"
+
+
+async def _submit_login_form(page) -> str:
+    """Отправка формы входа. Возвращает способ отправки или пустую строку."""
+    for sel in ("#login-btn", "div#login-btn.button", ".modal.visible #login-btn"):
+        try:
+            loc = page.locator(sel).first
+            if await loc.count() and await loc.is_visible():
+                await loc.click(timeout=5000)
+                return f"click:{sel}"
+        except Exception as e:
+            log.debug("[login] submit %s: %s", sel, e)
+    for sel in ("button[type='submit']", "input[type='submit']"):
+        try:
+            loc = page.locator(f"#login_form {sel}, form#login_form {sel}").first
+            if await loc.count() and await loc.is_visible():
+                await loc.click(timeout=3000)
+                return f"click:{sel}"
+        except Exception:
+            pass
+    for text in ("Войти", "Вход", "Log in"):
+        try:
+            loc = page.locator(
+                f"#login_pop >> text={text}, .modal.visible >> text={text}"
+            ).first
+            if await loc.count() and await loc.is_visible():
+                await loc.click(timeout=3000)
+                return f"text:{text}"
+        except Exception:
+            pass
+    try:
+        await page.locator("#lg-pas").press("Enter")
+        return "enter_on_password"
+    except Exception:
+        pass
+    try:
+        await page.evaluate("""() => {
+            const b = document.getElementById('login-btn');
+            if (b) { b.click(); return true; }
+            const f = document.getElementById('login_form');
+            if (f && f.requestSubmit) { f.requestSubmit(); return true; }
+            return false;
+        }""")
+        return "js_login_btn"
+    except Exception:
+        return ""
+
+
 async def login(page) -> bool:
     login_set = bool(LOGIN and LOGIN.strip())
     pwd_set = bool(PASSWORD and PASSWORD.strip())
@@ -127,78 +195,74 @@ async def login(page) -> bool:
         log.warning("[login] skip: credentials missing in env")
         return False
     try:
-        await page.goto("https://tbankrot.ru/", timeout=30000)
+        await page.goto("https://tbankrot.ru/", timeout=45000, wait_until="domcontentloaded")
         await page.wait_for_timeout(2000)
-        if await page.locator("text=Выйти").count():
-            log.info("[login] OK — already logged in")
+        ok, reason = await _confirm_login(page)
+        if ok:
+            log.info("[login] OK — already logged in (%s)", reason)
             return True
+
         log.info("[login] opening login modal")
-        await page.click("text=Войти", timeout=8000)
-        await page.wait_for_timeout(1500)
-        for tab in ("Email", "E-mail", "Почта", "email"):
+        opened = False
+        for sel in ("a.button.stroke:text('Войти')", "header a.button.stroke", "text=Войти"):
             try:
-                t = page.locator(f"text={tab}").first
-                if await t.count() and await t.is_visible():
-                    await t.click()
-                    await page.wait_for_timeout(400)
-                    log.info("[login] tab selected: %s", tab)
+                loc = page.locator(sel).first
+                if await loc.count() and await loc.is_visible():
+                    await loc.click(timeout=5000)
+                    opened = True
+                    log.info("[login] modal opened via %s", sel)
+                    break
+            except Exception as e:
+                log.debug("[login] open %s: %s", sel, e)
+        if not opened:
+            log.warning("[login] could not open login modal")
+            return False
+
+        await page.wait_for_selector("#login_form, #lg-mail", timeout=10000)
+        await page.wait_for_timeout(500)
+
+        email_filled = False
+        for sel in ("#lg-mail", "input[name='mail']", "input[type='email']"):
+            try:
+                loc = page.locator(sel).first
+                if await loc.count() and await loc.is_visible():
+                    await loc.fill(LOGIN, timeout=5000)
+                    email_filled = True
+                    log.info("[login] email filled via %s", sel)
                     break
             except Exception:
                 pass
-        email_sel = "input[type='email'], input[name*='mail'], input[placeholder*='mail' i]"
-        await page.wait_for_selector(email_sel, timeout=8000)
-        await page.fill(email_sel, LOGIN)
-        await page.wait_for_timeout(400)
+        if not email_filled:
+            log.warning("[login] email field not found")
+            return False
+
         pwd_filled = False
-        for sel in (
-            "[role='dialog'] input[type='password']",
-            "form input[type='password']",
-            "input[type='password']:visible",
-        ):
+        for sel in ("#lg-pas", "input[name='pas']", "#login_form input[type='password']"):
             try:
                 loc = page.locator(sel).first
-                if await loc.count():
+                if await loc.count() and await loc.is_visible():
                     await loc.fill(PASSWORD, timeout=5000)
                     pwd_filled = True
                     log.info("[login] password filled via %s", sel)
                     break
-            except Exception as e:
-                log.debug("[login] password selector %s: %s", sel, e)
+            except Exception:
+                pass
         if not pwd_filled:
-            await page.locator("input[type='password']").first.fill(PASSWORD, force=True)
-            log.info("[login] password filled via force")
-        await page.wait_for_timeout(400)
-        clicked = False
-        for btn in await page.query_selector_all("button"):
-            if (await btn.inner_text()).strip() == "Войти":
-                await btn.click()
-                clicked = True
-                break
-        if not clicked:
+            log.warning("[login] password field not found")
+            return False
+
+        submit_via = await _submit_login_form(page)
+        if not submit_via:
             log.warning("[login] submit button not found")
-        await page.wait_for_timeout(3500)
-        if await page.locator("text=Выйти").count():
-            log.info("[login] OK — logout link visible")
-            return True
-        await page.goto("https://tbankrot.ru/", timeout=20000)
-        await page.wait_for_timeout(1500)
-        ok = await page.locator("text=Выйти").count() > 0
-        if not ok:
-            ok = await page.locator("text=Войти").count() == 0
-        cookies = await page.context.cookies()
-        if not ok:
-            ok = any(
-                c.get("name", "").lower() in ("session", "sessionid", "auth", "token", "jwt")
-                or "session" in c.get("name", "").lower()
-                for c in cookies
-            )
-        if ok:
-            log.info("[login] OK — session confirmed (cookies=%d)", len(cookies))
         else:
-            log.warning(
-                "[login] NOT CONFIRMED — no logout link; cookie names: %s",
-                [c.get("name") for c in cookies[:12]],
-            )
+            log.info("[login] form submitted via %s", submit_via)
+
+        await page.wait_for_timeout(4500)
+        ok, reason = await _confirm_login(page)
+        if ok:
+            log.info("[login] OK — %s (submit=%s)", reason, submit_via or "none")
+        else:
+            log.warning("[login] NOT CONFIRMED — %s (submit=%s)", reason, submit_via or "none")
         return ok
     except Exception:
         log.exception("[login] FAIL")
@@ -246,36 +310,51 @@ def _legacy_extract_pdf_text(raw: bytes) -> tuple[str, str]:
     return "", "failed"
 
 
-async def _try_egrn_pdf(lot, page, ctx):
-    from analyzer import apply_egrn_to_lot
-    extract_pdf_text = discover_pdf_urls = None
+async def _try_lot_pdfs(lot, page, ctx):
+    """Скачивает все PDF лота, классифицирует и парсит ЕГРН + отчёт об оценке."""
+    from analyzer import apply_egrn_to_lot, apply_appraisal_to_lot
+    extract_pdf_text = discover_pdf_urls_fn = classify_pdf_type = None
     try:
-        from egrn_pdf import extract_pdf_text, discover_pdf_urls
+        from egrn_pdf import extract_pdf_text, discover_pdf_urls as discover_pdf_urls_fn
+        from appraisal_pdf import classify_pdf_type
     except ImportError as e:
-        print(f"    egrn_pdf недоступен ({e}), только pdfplumber")
+        log.warning("PDF modules unavailable: %s", e)
 
     desc = (lot.get("description") or "").lower()
     lot["has_egrn_on_site"] = any(x in desc for x in (
-        "egrn", "егрн", "выписк", "rosreestr", "росреестр",
+        "egrn", "егрн", "выписк", "rosreestr", "росреестр", "оценк", "pdf",
     ))
+    lot_url = lot.get("url") or f"https://tbankrot.ru/item?id={lot['id']}"
     html = ""
     try:
+        await page.goto(lot_url, timeout=25000, wait_until="domcontentloaded")
+        await page.wait_for_timeout(1500)
         html = await page.content()
-    except Exception:
-        pass
-    if discover_pdf_urls:
-        urls = discover_pdf_urls(html, lot["id"])
+    except Exception as e:
+        log.warning("lot page reload for PDFs failed: %s", e)
+        try:
+            html = await page.content()
+        except Exception:
+            pass
+    if discover_pdf_urls_fn:
+        urls = discover_pdf_urls_fn(html, lot["id"])
     else:
         urls = _legacy_discover_pdf_urls(lot["id"])
+
+    lot["pdf_urls_found"] = urls
+    downloaded: list[dict] = []
     got_pdf = False
 
     for pdf_url in urls:
         try:
             raw = await _fetch_pdf_bytes(page, pdf_url)
+            status = 0
             if not raw and ctx:
                 resp = await ctx.request.get(pdf_url)
+                status = resp.status
                 raw = await resp.body() if resp.status == 200 else b""
             if not raw:
+                log.debug("PDF skip %s status=%s", pdf_url, status)
                 continue
             if b"%PDF" not in raw[:10]:
                 continue
@@ -285,21 +364,52 @@ async def _try_egrn_pdf(lot, page, ctx):
                 text, method = extract_pdf_text(raw)
             else:
                 text, method = _legacy_extract_pdf_text(raw)
-            lot["egrn_extract_method"] = method
-            if text and len(text) >= 80:
+            doc_type = classify_pdf_type(text, pdf_url) if classify_pdf_type else "unknown"
+            entry = {
+                "url": pdf_url, "bytes": len(raw), "method": method,
+                "type": doc_type, "text_len": len(text or ""),
+            }
+            downloaded.append(entry)
+            log.info("PDF %s type=%s bytes=%d text=%d method=%s",
+                     pdf_url, doc_type, len(raw), len(text or ""), method)
+
+            if doc_type == "egrn" and text and len(text) >= 80:
                 apply_egrn_to_lot(lot, text, True)
-                print(f"    📄 ЕГРН ({method}, {len(text)} симв.)")
-                return
-            print(f"    📄 PDF {len(raw)} байт — текст не извлечён ({method})")
-            lot["egrn_ocr_failed"] = True
+                lot["egrn_extract_method"] = method
+                entry["parsed"] = "egrn"
+            elif doc_type == "appraisal" and text and len(text) >= 80:
+                apply_appraisal_to_lot(lot, text)
+                lot["appraisal_extract_method"] = method
+                entry["parsed"] = "appraisal"
+            elif text and len(text) >= 80:
+                if classify_pdf_type and classify_pdf_type(text, "") == "egrn":
+                    apply_egrn_to_lot(lot, text, True)
+                    lot["egrn_extract_method"] = method
+                    entry["parsed"] = "egrn"
+                elif classify_pdf_type and classify_pdf_type(text, "") == "appraisal":
+                    apply_appraisal_to_lot(lot, text)
+                    lot["appraisal_extract_method"] = method
+                    entry["parsed"] = "appraisal"
+                else:
+                    entry["parsed"] = "unclassified"
+            else:
+                lot["egrn_ocr_failed"] = lot.get("egrn_ocr_failed") or (doc_type == "egrn")
+                entry["parsed"] = "no_text"
         except Exception as e:
-            print(f"    PDF err: {e}")
+            log.warning("PDF err %s: %s", pdf_url, e)
             continue
 
-    if got_pdf:
-        lot["egrn_ocr_failed"] = True
-    elif lot.get("has_egrn_on_site"):
+    lot["pdfs_downloaded"] = downloaded
+    lot["pdfs_downloaded_count"] = len(downloaded)
+    if got_pdf and not lot.get("egrn_read_ok") and not lot.get("appraisal_parsed", {}).get("parsed_ok"):
+        if any(d.get("parsed") == "no_text" for d in downloaded):
+            lot["egrn_ocr_failed"] = True
+    elif not got_pdf and lot.get("has_egrn_on_site"):
         lot["pdf_download_failed"] = True
+
+
+# alias для совместимости
+_try_egrn_pdf = _try_lot_pdfs
 
 
 async def collect(page, regions, max_pages=MAX_PAGES) -> list:
@@ -372,7 +482,7 @@ async def enrich_heavy(lot, page, ctx):
                 pass
         if not lot.get("egrn_pdf_text"):
             try:
-                await asyncio.wait_for(_try_egrn_pdf(lot, page, ctx), timeout=PDF_TIMEOUT)
+                await asyncio.wait_for(_try_lot_pdfs(lot, page, ctx), timeout=PDF_TIMEOUT)
             except asyncio.TimeoutError:
                 lot["pdf_timeout"] = True
             except Exception as e:
