@@ -25,29 +25,6 @@ def _fmt_money(v) -> str:
     return "не указано"
 
 
-def _encumbrance_status(text: str) -> str:
-    if not text or not str(text).strip():
-        return "не указано"
-    tl = str(text).lower()
-    has_negative = any(x in tl for x in (
-        "ограничен", "ипотек", "залог", "арест", "сервитут", "рента",
-        "статьей 56", "ст. 56",
-    ))
-    has_clean = any(x in tl for x in (
-        "не зарегистрир", "отсутств", "нет (по тексту", "без обремен",
-        "обременени",  # часто «обременения: не зарегистрировано»
-    ))
-    if has_negative and ("ограничен" in tl or "статьей" in tl or "ипотек" in tl or "арест" in tl):
-        return "есть ограничения/обременения"
-    if has_negative:
-        return "есть упоминания — проверить вручную"
-    if has_clean and "не зарегистрир" in tl:
-        return "нет (по тексту ЕГРН)"
-    if has_clean:
-        return "явных обременений в тексте нет"
-    return "не указано"
-
-
 def _egrn_object_label(rec: dict) -> str:
     title = (rec.get("source_title") or "").strip()
     if title:
@@ -60,6 +37,109 @@ def _egrn_object_label(rec: dict) -> str:
         return title[:50]
     cad = rec.get("cadastral") or "объект"
     return f"кад. {cad}"
+
+
+def _egrn_object_line(rec: dict, idx: int) -> dict:
+    """Конкретная строка по объекту ЕГРН с источником."""
+    label = _egrn_object_label(rec)
+    cad = rec.get("cadastral") or "не указано"
+    source = rec.get("source_title") or rec.get("source") or f"ЕГРН #{idx}"
+    enc = rec.get("encumbrances") or "не указано в тексте"
+    if rec.get("encumbrances_clean"):
+        enc_display = enc
+    else:
+        enc_display = enc
+
+    return {
+        "label": label,
+        "cadastral": cad,
+        "owner": rec.get("owner") or "не указано",
+        "area": rec.get("area") or "не указано",
+        "encumbrances": enc_display,
+        "encumbrances_clean": bool(rec.get("encumbrances_clean")),
+        "arrests": rec.get("arrests") or "не указано",
+        "source": source,
+        "parsed_ok": bool(rec.get("parsed_ok")),
+    }
+
+
+def _build_market_comparison(lot: dict, an: dict, appr: dict) -> dict:
+    """Сравнение цены лота с рынком — только если рынок из отчёта/документов."""
+    price_lot = float(lot.get("price") or an.get("lot_price_raw") or 0)
+    market = int(
+        appr.get("market_price")
+        or appr.get("appraisal_price")
+        or an.get("market_price_raw")
+        or 0
+    )
+    source = ""
+    if appr.get("parsed_ok") and (appr.get("market_price") or appr.get("appraisal_price")):
+        source = f"отчёт об оценке ({appr.get('extract_method') or 'текст'})"
+        if appr.get("source_title"):
+            source += f": {appr['source_title'][:60]}"
+    elif an.get("market_source") == "appraisal":
+        source = "отчёт об оценке (карточка)"
+    elif an.get("market_known") and an.get("market_source"):
+        source = f"ориентир {an.get('market_source')} — не из отчёта"
+        market = int(an.get("market_price_raw") or 0)
+
+    if not market or market <= 0:
+        return {
+            "known": False,
+            "lines": ["Рынок не определён — отчёт не распознан или стоимость не извлечена"],
+            "discount_pct": None,
+        }
+
+    lines = [
+        f"Рыночная оценка: {_fmt_money(market)} — источник: {source or 'отчёт'}",
+    ]
+    if price_lot > 0:
+        disc = round((market - price_lot) / market * 100) if market > price_lot else 0
+        premium = round((price_lot - market) / market * 100) if price_lot > market else 0
+        lines.append(f"Цена лота: {_fmt_money(price_lot)}")
+        if disc > 0:
+            lines.append(f"Дисконт к оценке отчёта: {disc}%")
+        elif premium > 0:
+            lines.append(f"Лот дороже оценки отчёта на {premium}%")
+        else:
+            lines.append("Цена лота равна оценке отчёта")
+    else:
+        disc = None
+        lines.append("Цена лота на сайте не определена — дисконт не считается")
+
+    if appr.get("comparables_range", "не указано") != "не указано":
+        lines.append(f"По аналогам (раздел «Объявления», отчёт): {appr['comparables_range']}")
+    if appr.get("liquidation_price"):
+        lines.append(f"Ликвидационная стоимость (отчёт): {_fmt_money(appr['liquidation_price'])}")
+
+    return {"known": True, "lines": lines, "discount_pct": disc if price_lot > 0 else None, "market": market}
+
+
+def _build_trading_section(lot: dict, appr: dict) -> list[str]:
+    """Торги: карточка + аналитика из отчёта (если есть)."""
+    lines = []
+    fmt = lot.get("auction_format") or ""
+    if fmt:
+        lines.append(f"Формат (карточка): {fmt}")
+    sc, st = lot.get("step_current", 0), lot.get("step_total", 0)
+    if sc and st:
+        left = max(0, st - sc)
+        lines.append(f"Стадия (карточка): шаг {sc}/{st}, осталось снижений: {left}")
+    if lot.get("next_reduction_date") and lot.get("next_reduction_price"):
+        np = lot["next_reduction_price"]
+        lines.append(
+            f"След. снижение (карточка): {lot['next_reduction_date']} → {_fmt_money(np)}"
+        )
+    parts = lot.get("participants")
+    if parts is not None:
+        lines.append(f"Заявок на момент карточки: {parts}")
+
+    if appr.get("auction_avg_reduction_pct", "не указано") != "не указано":
+        lines.append(f"Среднее снижение (отчёт, аналитика торгов): {appr['auction_avg_reduction_pct']}")
+    if appr.get("auction_participants_hint", "не указано") != "не указано":
+        lines.append(f"Заявок по аналитике отчёта: {appr['auction_participants_hint']}")
+
+    return lines
 
 
 def _documents_coverage(lot: dict) -> dict[str, str]:
@@ -105,48 +185,28 @@ def extract_document_facts(lot: dict, an: dict) -> dict[str, Any]:
         egrn_records = list(egrn_parsed["objects"])
 
     egrn_objects: list[dict] = []
-    for rec in egrn_records:
-        enc_st = _encumbrance_status(rec.get("encumbrances", ""))
-        egrn_objects.append({
-            "label": _egrn_object_label(rec),
-            "cadastral": rec.get("cadastral") or "не указано",
-            "owner": rec.get("owner") or "не указано",
-            "area": rec.get("area") or "не указано",
-            "encumbrances": enc_st,
-            "encumbrances_raw": (rec.get("encumbrances") or "")[:160],
-            "arrests": rec.get("arrests") or "не указано",
-            "parsed_ok": bool(rec.get("parsed_ok")),
-            "source": rec.get("source_title") or "ЕГРН",
-        })
+    for i, rec in enumerate(egrn_records, 1):
+        egrn_objects.append(_egrn_object_line(rec, i))
 
     coverage = _documents_coverage(lot)
     has_any_egrn = bool(egrn_objects) or coverage["egrn"] in ("распознан", "скачан, текст не извлечён")
 
-    # Сводка по обременениям
-    enc_issues = [o for o in egrn_objects if "есть" in o["encumbrances"]]
-    enc_clean = [o for o in egrn_objects if o["encumbrances"].startswith("нет")]
+    enc_issues = [o for o in egrn_objects if not o.get("encumbrances_clean") and o["encumbrances"] != "не указано в тексте"]
+    enc_clean = [o for o in egrn_objects if o.get("encumbrances_clean")]
 
     appr = lot.get("appraisal_parsed") or {}
-    market_known = bool(an.get("market_known"))
-    market_source = an.get("market_source") or ""
+    market_cmp = _build_market_comparison(lot, an, appr)
+    trading_lines = _build_trading_section(lot, appr)
+
+    # статус отчёта
+    appr_doc = next((d for d in (lot.get("lot_documents") or []) if d.get("type") == "appraisal"), None)
+    appr_method = appr.get("extract_method") or (appr_doc or {}).get("method") or ""
     if appr.get("parsed_ok"):
-        market_line = appr.get("summary") or "ориентир из отчёта об оценке"
-        market_status = "определена из отчёта"
+        appr_status = f"распознан ({appr_method or 'текст'})"
     elif coverage["appraisal"] == "скачан, текст не извлечён":
-        market_line = "отчёт скачан, текст не распознан (вероятно скан)"
-        market_status = "не определена"
-    elif coverage["appraisal"] == "распознан":
-        market_line = appr.get("summary") or "данные отчёта частично извлечены"
-        market_status = "частично"
-    elif market_known and market_source == "appraisal":
-        market_line = an.get("market_comment") or "из отчёта"
-        market_status = "из отчёта (карточка)"
-    elif market_known:
-        market_line = f"ориентир {an.get('market_price', '—')} ({market_source or 'расчёт'})"
-        market_status = "ориентир без отчёта"
+        appr_status = f"скачан, OCR не дал текста ({appr_method or 'failed'})"
     else:
-        market_line = "не определена — отчёт не распознан или не получен"
-        market_status = "не определена"
+        appr_status = coverage["appraisal"]
 
     contract = lot.get("contract_parsed") or {}
     application = lot.get("application_parsed") or {}
@@ -165,8 +225,10 @@ def extract_document_facts(lot: dict, an: dict) -> dict[str, Any]:
         "egrn_encumbrance_issues": enc_issues,
         "egrn_encumbrance_clean": enc_clean,
         "coverage": coverage,
-        "market_status": market_status,
-        "market_line": market_line,
+        "appraisal_status": appr_status,
+        "appraisal_parsed": appr,
+        "market_comparison": market_cmp,
+        "trading_lines": trading_lines,
         "appraisal_flags": appr.get("restriction_flags") or lot.get("appraisal_flags") or [],
         "appraisal_court": appr.get("court_cases") or "не указано",
         "contract_summary": contract.get("summary") if contract.get("parsed_ok") else "",
@@ -175,7 +237,7 @@ def extract_document_facts(lot: dict, an: dict) -> dict[str, Any]:
         "documents_downloaded": lot.get("documents_downloaded_count") or 0,
         "doc_types_found": doc_types_found,
         "price_lot": lot.get("price") or an.get("lot_price_raw"),
-        "discount_pct": an.get("discount_pct"),
+        "discount_pct": market_cmp.get("discount_pct") if market_cmp.get("known") else an.get("discount_pct"),
         "document_status": an.get("document_status") or "",
     }
 
@@ -193,23 +255,41 @@ def build_verdict_sections(facts: dict) -> dict[str, Any]:
     # --- Известное из документов ---
     if facts["egrn_count"]:
         known_lines.append(f"ЕГРН: {facts['egrn_count']} выписк(и/а) распознана(ы)")
-        for obj in facts["egrn_objects"]:
+        for i, obj in enumerate(facts["egrn_objects"], 1):
             line = (
-                f"  • {obj['label']}: кад. {obj['cadastral']}, "
-                f"обременения — {obj['encumbrances']}"
+                f"  • Объект {i} ({obj['label']}), кад. {obj['cadastral']}: "
+                f"{obj['encumbrances']} [источник: {obj['source'][:55]}]"
             )
             if obj["owner"] != "не указано":
-                line += f", собственник: {obj['owner'][:70]}"
+                line += f"; собственник: {obj['owner'][:60]}"
+            if obj["area"] != "не указано":
+                line += f"; {obj['area']}"
             known_lines.append(line)
     elif cov["egrn"] == "скачан, текст не извлечён":
         unknown_lines.append("ЕГРН: файл скачан, текст не извлечён")
     elif cov["egrn"] == "не получен":
         unknown_lines.append("ЕГРН: не получена")
 
-    if facts["market_status"] == "определена из отчёта":
-        known_lines.append(f"Рыночная оценка: {facts['market_line']}")
+    mc = facts.get("market_comparison") or {}
+    if mc.get("known"):
+        known_lines.append("*Сравнение с рынком (отчёт):*")
+        known_lines.extend(f"  {ln}" for ln in mc.get("lines", []))
     else:
-        unknown_lines.append(f"Рыночная цена: {facts['market_line']}")
+        for ln in mc.get("lines", ["Рынок не определён"]):
+            unknown_lines.append(ln)
+
+    if facts.get("appraisal_status") and "распознан" in facts["appraisal_status"]:
+        appr = facts.get("appraisal_parsed") or {}
+        if appr.get("summary"):
+            known_lines.append(f"Отчёт об оценке [{facts['appraisal_status']}]: {appr['summary'][:200]}")
+    elif cov["appraisal"] == "скачан, текст не извлечён":
+        unknown_lines.append(
+            f"Отчёт об оценке: {facts.get('appraisal_status', 'скачан, текст не извлечён')}"
+        )
+
+    if facts.get("trading_lines"):
+        known_lines.append("*Торги:*")
+        known_lines.extend(f"  • {tl}" for tl in facts["trading_lines"])
 
     if cov["contract"] == "распознан" and facts["contract_summary"]:
         known_lines.append(f"Договор: {facts['contract_summary'][:120]}")
@@ -229,12 +309,16 @@ def build_verdict_sections(facts: dict) -> dict[str, Any]:
     # --- Плюсы ---
     for obj in facts["egrn_encumbrance_clean"]:
         pluses.append(
-            f"ЕГРН ({obj['label']}): обременений по тексту выписки нет"
+            f"ЕГРН «{obj['source'][:45]}» (кад. {obj['cadastral']}): {obj['encumbrances']}"
         )
     if facts["egrn_count"] >= 2:
-        pluses.append(f"Полный комплект выписок: {facts['egrn_count']} объекта в документах")
-    if facts["market_status"] == "определена из отчёта":
-        pluses.append("Есть ориентир рыночной стоимости из отчёта об оценке")
+        pluses.append(f"Комплект выписок: {facts['egrn_count']} объекта")
+    if mc.get("known") and mc.get("discount_pct") and mc["discount_pct"] > 0:
+        pluses.append(
+            f"Дисконт {mc['discount_pct']}% к рыночной оценке отчёта (факт из документов)"
+        )
+    if mc.get("known"):
+        pluses.append("Рыночный ориентир из отчёта об оценке")
     if facts["contract_summary"]:
         pluses.append("Проект договора прочитан — виден предмет сделки")
     if cov["photo"] == "есть":
@@ -243,21 +327,23 @@ def build_verdict_sections(facts: dict) -> dict[str, Any]:
     # --- Минусы / внимание ---
     for obj in facts["egrn_encumbrance_issues"]:
         minuses.append(
-            f"ЕГРН ({obj['label']}): {obj['encumbrances']}"
-            + (f" — {obj['encumbrances_raw'][:80]}" if obj.get("encumbrances_raw") else "")
+            f"ЕГРН «{obj['source'][:45]}» (кад. {obj['cadastral']}): {obj['encumbrances']}"
         )
     for obj in facts["egrn_objects"]:
         if obj["arrests"] and obj["arrests"] != "не указано":
-            minuses.append(f"ЕГРН ({obj['label']}): аресты — {obj['arrests'][:80]}")
+            minuses.append(
+                f"ЕГРН «{obj['source'][:40]}»: аресты — {obj['arrests'][:90]}"
+            )
     for flag in facts["appraisal_flags"]:
-        minuses.append(f"Отчёт об оценке: зона/ограничение — {flag}")
+        minuses.append(f"Отчёт об оценке: {flag}")
     if facts["appraisal_court"] not in ("не указано", "не обнаружены", ""):
         if "обнаруж" in str(facts["appraisal_court"]).lower():
             minuses.append(f"Отчёт об оценке: судебные дела — {facts['appraisal_court']}")
     if not facts["egrn_has_data"]:
         minuses.append("Нет распознанной выписки ЕГРН — юр. статус не проверен")
-    if cov["appraisal"] == "скачан, текст не извлечён":
-        minuses.append("Отчёт об оценке не распознан — рыночный ориентир недоступен")
+    if cov["appraisal"] == "скачан, текст не извлечён" or not (facts.get("appraisal_parsed") or {}).get("parsed_ok"):
+        if cov["appraisal"] != "не получен":
+            minuses.append("Отчёт об оценке не распознан — сравнение с рынком недоступно")
 
     # --- Ручные проверки ---
     if not facts["egrn_has_data"]:
@@ -274,52 +360,84 @@ def build_verdict_sections(facts: dict) -> dict[str, Any]:
 
     manual = list(dict.fromkeys(m for m in manual if m))
 
-    # --- Уровень риска по документам ---
-    risk_score = 0
-    risk_reasons: list[str] = []
-
-    if not facts["egrn_has_data"]:
-        risk_score += 3
-        risk_reasons.append("нет проверенной выписки ЕГРН")
-    if facts["egrn_encumbrance_issues"]:
-        risk_score += 2 * len(facts["egrn_encumbrance_issues"])
-        risk_reasons.append("обременения/ограничения в выписках")
-    if any("арест" in (o.get("arrests") or "").lower() for o in facts["egrn_objects"]):
-        risk_score += 2
-        risk_reasons.append("упоминание арестов")
-    if cov["appraisal"] == "скачан, текст не извлечён":
-        risk_score += 1
-        risk_reasons.append("отчёт об оценке не распознан")
-    if facts["appraisal_flags"]:
-        risk_score += 1
-        risk_reasons.append("зоны ограничений в отчёте")
-
-    if risk_score >= 4:
-        risk_level = "высокий"
-    elif risk_score >= 2:
-        risk_level = "средний"
-    elif facts["egrn_has_data"] and not facts["egrn_encumbrance_issues"]:
-        risk_level = "низкий"
-    elif not facts["egrn_has_data"]:
-        risk_level = "высокий"
-    else:
-        risk_level = "средний"
-
-    if not risk_reasons:
-        if risk_level == "низкий":
-            risk_reasons.append("выписки прочитаны, критичных обременений в тексте не найдено")
-        else:
-            risk_reasons.append("данных недостаточно для уверенной оценки")
+    risk_level = _calc_risk_level(facts, cov)
+    risk_reasons = _risk_reasons(facts, cov)
+    assessment_score, assessment_logic = _unified_assessment(facts, risk_level)
 
     return {
         "known_lines": known_lines,
         "unknown_lines": unknown_lines,
-        "pluses": pluses[:6],
-        "minuses": minuses[:8],
+        "pluses": pluses[:8],
+        "minuses": minuses[:10],
         "manual_checks": manual[:6],
         "document_risk_level": risk_level,
-        "document_risk_reasons": risk_reasons[:4],
+        "document_risk_reasons": risk_reasons,
+        "assessment_score": assessment_score,
+        "assessment_logic": assessment_logic,
     }
+
+
+def _calc_risk_level(facts: dict, cov: dict) -> str:
+    risk_score = 0
+    if not facts["egrn_has_data"]:
+        risk_score += 3
+    if facts["egrn_encumbrance_issues"]:
+        risk_score += 2 * len(facts["egrn_encumbrance_issues"])
+    if any("арест" in (o.get("arrests") or "").lower() for o in facts["egrn_objects"]):
+        risk_score += 2
+    if not (facts.get("market_comparison") or {}).get("known"):
+        risk_score += 1
+    if facts["appraisal_flags"]:
+        risk_score += 1
+    if risk_score >= 4:
+        return "высокий"
+    if risk_score >= 2:
+        return "средний"
+    if facts["egrn_has_data"] and not facts["egrn_encumbrance_issues"]:
+        return "низкий"
+    return "высокий" if not facts["egrn_has_data"] else "средний"
+
+
+def _risk_reasons(facts: dict, cov: dict) -> list[str]:
+    reasons: list[str] = []
+    if not facts["egrn_has_data"]:
+        reasons.append("нет проверенной выписки ЕГРН")
+    for obj in facts["egrn_encumbrance_issues"]:
+        reasons.append(f"{obj['label']} (кад. {obj['cadastral']}): {obj['encumbrances'][:60]}")
+    if any("арест" in (o.get("arrests") or "").lower() for o in facts["egrn_objects"]):
+        reasons.append("упоминание арестов в выписке")
+    if not (facts.get("market_comparison") or {}).get("known"):
+        reasons.append("рыночный ориентир из отчёта отсутствует")
+    if facts["appraisal_flags"]:
+        reasons.append("зоны ограничений в отчёте")
+    if not reasons:
+        reasons.append("критичных обременений в прочитанных выписках не найдено")
+    return reasons[:5]
+
+
+def _unified_assessment(facts: dict, risk_level: str) -> tuple[int, str]:
+    """
+    Единый балл 0–100: выше = больше ясности по документам и ниже юр. риск.
+    Не инвест-привлекательность — информированность для решения.
+    """
+    base = {"низкий": 72, "средний": 48, "высокий": 22}[risk_level]
+    logic = [f"риск по документам: {risk_level}"]
+    mc = facts.get("market_comparison") or {}
+    if mc.get("known"):
+        base += 12
+        logic.append("рыночная оценка из отчёта прочитана")
+    else:
+        base -= 8
+        logic.append("рынок не определён — ценовая привлекательность не оценивается")
+    if facts["egrn_encumbrance_issues"]:
+        base -= 6 * min(len(facts["egrn_encumbrance_issues"]), 3)
+        logic.append(
+            f"обременения в {len(facts['egrn_encumbrance_issues'])} выписках снижают балл"
+        )
+    if facts["egrn_count"] >= 2:
+        base += 4
+        logic.append(f"прочитано {facts['egrn_count']} выписок ЕГРН")
+    return max(0, min(100, base)), "; ".join(logic)
 
 
 def format_verdict_card(facts: dict, sections: dict) -> str:
@@ -355,12 +473,22 @@ def format_verdict_card(facts: dict, sections: dict) -> str:
         lines.append("")
 
     rl = sections["document_risk_level"]
-    rr = "; ".join(sections["document_risk_reasons"])
+    rr = "; ".join(sections["document_risk_reasons"][:3])
     lines.append(f"*Риск по документам:* {rl} — {rr}")
 
+    asc = sections.get("assessment_score")
+    if asc is not None:
+        lines.append(f"*Оценка по документам:* {asc}/100")
+        if sections.get("assessment_logic"):
+            lines.append(f"  _{sections['assessment_logic']}_")
+
     price_s = _fmt_money(facts.get("price_lot"))
-    disc = facts.get("discount_pct")
-    disc_s = f"{disc}%" if disc and str(disc) not in ("?", "0", "") else "не указано"
+    mc = facts.get("market_comparison") or {}
+    if mc.get("known") and mc.get("discount_pct"):
+        disc_s = f"{mc['discount_pct']}% к оценке отчёта"
+    else:
+        disc = facts.get("discount_pct")
+        disc_s = f"{disc}%" if disc and str(disc) not in ("?", "0", "") else "не определён"
     lines.append(f"*Цена лота:* {price_s} | *Дисконт:* {disc_s}")
 
     lines.append("")
@@ -375,8 +503,9 @@ def run_verdict_pipeline(lot: dict, an: dict) -> dict:
     card = format_verdict_card(facts, sections)
 
     rl = sections["document_risk_level"]
-    headline = f"Риск по документам: {rl}"
-    detail = "; ".join(sections["document_risk_reasons"][:2]) or "см. карточку"
+    asc = sections.get("assessment_score", 50)
+    headline = f"Риск: {rl} | оценка {asc}/100"
+    detail = sections.get("assessment_logic") or "; ".join(sections["document_risk_reasons"][:2])
 
     risk_emoji = {"низкий": "🟢", "средний": "🟡", "высокий": "🔴"}.get(rl, "🟡")
 
@@ -389,9 +518,11 @@ def run_verdict_pipeline(lot: dict, an: dict) -> dict:
         "manual_checks": sections["manual_checks"],
         "known_lines": sections["known_lines"],
         "unknown_lines": sections["unknown_lines"],
-        "risk_score": {"низкий": 25, "средний": 55, "высокий": 85}.get(rl, 55),
+        "assessment_score": asc,
+        "assessment_logic": sections.get("assessment_logic", ""),
+        "risk_score": 100 - asc,
         "risk_level": risk_emoji,
-        "invest_score": None,
+        "invest_score": asc,
         "verdict_label": headline,
         "verdict_detail": detail,
         "verdict_card": card,
