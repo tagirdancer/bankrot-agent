@@ -92,23 +92,38 @@ def _ocr_pdf(raw: bytes, max_pages: int) -> str:
 
 
 def discover_pdf_urls(html: str, lot_id: str) -> list[str]:
-    """URL PDF с страницы лота + стандартные пути."""
-    urls = [
+    """Все PDF со страницы лота; угадываемые URL ЕГРН — в конце как fallback."""
+    urls: list[str] = []
+    if html:
+        for m in re.finditer(r'https?://[^"\'>\s]+\.pdf(?:[^"\'>\s]*)?', html, re.I):
+            urls.append(m.group(0).split("&quot;")[0].split('"')[0])
+        for m in re.finditer(r'["\']([^"\']+\.pdf(?:[^"\']*)?)["\']', html, re.I):
+            u = m.group(1).replace("\\/", "/")
+            if u.startswith("//"):
+                u = "https:" + u
+            elif not u.startswith("http"):
+                u = "https://tbankrot.ru" + (u if u.startswith("/") else "/" + u)
+            urls.append(u)
+        for m in re.finditer(
+            r'(?:href|data-url|data-href)\s*=\s*["\']([^"\']*(?:pdf|files\.tbankrot)[^"\']*)["\']',
+            html, re.I,
+        ):
+            u = m.group(1)
+            if ".pdf" in u.lower() or "files.tbankrot" in u.lower():
+                if not u.startswith("http"):
+                    u = "https://tbankrot.ru" + (u if u.startswith("/") else "/" + u)
+                urls.append(u)
+
+    for u in (
         f"https://files.tbankrot.ru/egrn_files/{lot_id}.pdf",
         f"https://tbankrot.ru/files/egrn/{lot_id}.pdf",
-        f"https://tbankrot.ru/item/egrn?id={lot_id}",
-    ]
-    if html:
-        for m in re.finditer(r'https?://[^"\'>\s]+\.pdf[^"\'>\s]*', html, re.I):
-            urls.append(m.group(0))
-        for m in re.finditer(r'(/[^"\'>\s]*egrn[^"\'>\s]*\.pdf[^"\'>\s]*)', html, re.I):
-            u = m.group(1)
-            if not u.startswith("http"):
-                u = "https://tbankrot.ru" + u
-            urls.append(u)
+    ):
+        urls.append(u)
+
     seen, out = set(), []
     for u in urls:
-        if u not in seen:
+        u = u.split("#")[0].strip()
+        if u and u not in seen:
             seen.add(u)
             out.append(u)
     return out
