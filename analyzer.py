@@ -174,24 +174,21 @@ def format_short_lot_message(lot: dict, an: dict, label: str = "ЛОТ") -> str:
         lines.append(f"🚗 {an['auto_summary']}")
     elif an.get("legal_text"):
         lines.append(f"📋 {an['legal_text'][:140]}")
+    if an.get("document_risk_level"):
+        lines.append(f"📋 Риск по документам: {an['document_risk_level']}")
+    pluses = an.get("verdict_pluses") or []
+    minuses = an.get("verdict_minuses") or []
+    if pluses:
+        lines.append("✅ " + " | ".join(str(p) for p in pluses[:2]))
+    if minuses:
+        lines.append("⚠️ " + " | ".join(str(m) for m in minuses[:2]))
     trading = an.get("trading_summary", "")
     if trading:
         lines.append(f"📋 {trading}")
-    if an.get("risk_level"):
-        lines.append(
-            f"⚖️ Риск: {an['risk_level']} ({an.get('risk_score', '?')}/100) | "
-            f"Инвест: {an.get('invest_score', '?')}/100"
-        )
-    flags = an.get("red_flags_text", "")
-    if flags:
-        lines.append(f"⚠️ Флаги: {flags}")
-    if lot_type := an.get("lot_type"):
-        if lot_type == "земля" and lot.get("land_vri"):
-            lines.append(f"🌱 Земля: {lot.get('land_vri')}")
     detail = an.get("verdict_detail", "")
-    detail_s = f" — {detail[:70]}" if detail else ""
+    detail_s = f" — {detail[:90]}" if detail else ""
     lines += [
-        f"{an.get('action_emoji', '⚠️')} *{verdict}*{detail_s}",
+        f"{an.get('action_emoji', '📋')} *{verdict}*{detail_s}",
         f"🔗 {lot.get('url', '')}",
     ]
     return "\n".join(lines)
@@ -1002,8 +999,10 @@ async def get_expert_analysis(title, lot_type, region_name, lot_price,
     if rosreestr_data: all_docs += f"\n=== Данные Росреестра ===\n{rosreestr_data}"
     has_docs = len(all_docs) > 50
 
-    prompt = f"""Ты опытный юрист и финансовый эксперт по банкротным торгам России.
-Анализируй строго как {lot_type.upper()}.
+    prompt = f"""Ты помощник по банкротным торгам. Анализируй строго как {lot_type.upper()}.
+НЕ давай рекомендаций «бери/не бери», «отличная инвестиция», процентов доходности.
+Только факты из документов и честно отмечай, что неизвестно.
+
 ═══ ОБЪЕКТ ═══
 Тип: {lot_type.upper()}
 Название: {title[:200]}
@@ -1011,39 +1010,34 @@ async def get_expert_analysis(title, lot_type, region_name, lot_price,
 Цена торгов: {f'{lot_price:,.0f}₽' if lot_price else 'не определена'}
 Рыночная цена: {f'{market_price:,.0f}₽' if market_price else 'не определена'}
 Дисконт к рынку: {disc_pct}%
-Участников в торгах: {parts_n}
-{'⚠️ ВНИМАНИЕ: дисконт более 40% — проверь причину!' if disc_pct >= 40 else ''}
-Аренда/мес: {f'{rental:,.0f}₽' if rental else 'нет'}
+Участников: {parts_n}
 {step_info}
-{f'Кадастровый номер: {cadastral}' if cadastral else 'Кадастр: не найден'}
+{f'Кадастр: {cadastral}' if cadastral else 'Кадастр: не найден'}
 {f'VIN: {vin}' if vin else ''}
-Наличие документов: {'ДА — анализируй детально' if has_docs else 'НЕТ — анализируй по названию'}
+Документы: {'есть — опирайся на них' if has_docs else 'не получены — не выдумывай юр. статус'}
+
 ═══ ДОКУМЕНТЫ ═══
-{all_docs if all_docs else 'Документы не получены. Анализируй по типу объекта и региону.'}
+{all_docs if all_docs else 'Документы не получены.'}
+
 Ответь ТОЛЬКО JSON:
 {{
-  "legal_summary": "X собственников. Обременения: ... Аресты: ...",
-  "encumbrances": "ипотека Сбербанк (снимается при покупке) / нет обременений",
-  "owners_count": "1",
-  "has_hidden_risks": false,
-  "legal_risks": ["риск 1"],
-  "invest_risks": ["инвест риск 1"],
-  "invest_opportunities": ["плюс 1 с цифрами", "плюс 2"],
-  "invest_potential": "высокий",
-  "risk_level": "низкий",
-  "liquidity_level": "высокая",
-  "liquidity_days": 45,
-  "exit_strategy": "перепродажа за 30-60 дней / сдача в аренду X₽/мес",
-  "strategy": "Конкретно: почему входить или нет. Ключевые цифры.",
-  "what_to_check": "КОНКРЕТНО для {lot_type}: укажи 3-5 пунктов специфичных для этого объекта и его ситуации",
-  "action": "ВХОДИТЬ СЕЙЧАС",
-  "verdict": "РЕКОМЕНДУЕТСЯ К ПОКУПКЕ",
-  "verdict_simple": "ОБЯЗАТЕЛЬНО напиши: БРАТЬ или НЕ БРАТЬ и одну причину. Например: БРАТЬ — дисконт 61% и нет заявок. Или: НЕ БРАТЬ — цена выше рынка."
+  "legal_summary": "кратко: собственник, обременения, аресты — только если есть в тексте",
+  "encumbrances": "нет / есть (что именно) / не указано в документах",
+  "owners_count": "число или не указано",
+  "legal_risks": ["факт из документов"],
+  "invest_risks": ["факт или неизвестное"],
+  "invest_opportunities": ["факт из документов, без оценочных суждений"],
+  "invest_potential": "не оценивается",
+  "risk_level": "низкий / средний / высокий / не определён",
+  "liquidity_level": "не оценивается",
+  "liquidity_days": 0,
+  "exit_strategy": "",
+  "strategy": "нейтрально: что известно и чего не хватает для решения",
+  "what_to_check": "3-5 пунктов проверки вручную для {lot_type}",
+  "action": "ПРОВЕРИТЬ ДОКУМЕНТЫ",
+  "verdict": "сводка фактов без рекомендации покупать"
 }}
-action: ВХОДИТЬ СЕЙЧАС / ЖДАТЬ СНИЖЕНИЯ / ПРОВЕРИТЬ ДОКУМЕНТЫ / ПРОПУСТИТЬ
-invest_potential: высокий / средний / низкий
-risk_level: низкий / средний / высокий / критический
-Если дисконт > 50% и нет документов — risk_level = высокий"""
+Запрещено: БРАТЬ, НЕ БРАТЬ, РЕКОМЕНДУЮ, заработаешь, отличная инвестиция."""
 
     if not GROQ_KEY:
         log.error("GROQ_API_KEY отсутствует в окружении — Groq-анализ невозможен, "
@@ -1388,9 +1382,9 @@ async def analyze_lot(lot: dict, light: bool = False) -> dict:
 
     extra = []
     if market_known and disc_pct >= 60:
-        extra.append(f"⚠️ Дисконт {disc_pct}% — проверьте причину низкой цены!")
+        extra.append(f"Дисконт {disc_pct}% — причина не объяснена в документах")
     elif market_known and disc_pct >= 40:
-        extra.append(f"💡 Дисконт {disc_pct}% — выгодно при чистых документах")
+        extra.append(f"Дисконт {disc_pct}% — сверить с отчётом об оценке")
     if is_real_estate(lot_type) and cadastral:
         cad_line = f"🏛 Кадастр: {cadastral}"
         if rosreestr:
@@ -1399,21 +1393,21 @@ async def analyze_lot(lot: dict, light: bool = False) -> dict:
     if lot_type == "авто" and vin:
         extra.append(f"🔍 VIN: {vin}")
     if parts_n == 0:
-        extra.append("👥 Нет заявок" + (" — можно взять по стартовой цене" if market_known else ""))
+        extra.append("Нет заявок на момент анализа")
     elif parts_n == 1:
-        extra.append("👥 1 участник — конкуренция низкая")
+        extra.append("1 участник")
     elif parts_n <= 3:
-        extra.append(f"👥 {parts_n} участника — умеренная конкуренция")
+        extra.append(f"{parts_n} участника")
     elif parts_n > 5:
-        extra.append(f"👥 ⚠️ {parts_n} участников — высокая конкуренция!")
+        extra.append(f"{parts_n} участников — высокая конкуренция")
     valid_risks = [r for r in risks if r not in
                    ("нет данных", "документы не получены — проверьте перед покупкой",
                     "требует проверки", "стандартные риски")]
     valid_opps = [o for o in opps if o not in ("требует анализа",)]
     if market_known and valid_risks:
-        extra.append("⚠️ Риски: " + " | ".join(str(r) for r in valid_risks[:2]))
+        extra.append("Риски (Groq): " + " | ".join(str(r) for r in valid_risks[:2]))
     if market_known and valid_opps:
-        extra.append("✨ Плюсы: " + " | ".join(str(o) for o in valid_opps[:2]))
+        extra.append("Факты (Groq): " + " | ".join(str(o) for o in valid_opps[:2]))
     encumb = expert.get("encumbrances", "") or encumb_from_egrn or ""
     exit_s = expert.get("exit_strategy", "") or ""
     strategy = expert.get("strategy", "")
@@ -1433,23 +1427,20 @@ async def analyze_lot(lot: dict, light: bool = False) -> dict:
     except Exception:
         log.exception("verdict pipeline failed for lot %s", lot.get("id", ""))
         vr = {
-            "verdict_label": "Смотреть",
+            "verdict_label": "Риск по документам: не определён",
             "verdict_detail": "вердикт не рассчитан",
             "verdict_card": "",
             "risk_score": 50,
-            "risk_level": "средний",
-            "invest_score": 50,
+            "risk_level": "🟡",
+            "document_risk_level": "средний",
+            "verdict_pluses": [],
+            "verdict_minuses": [],
             "facts_json": {},
             "manual_checks": [],
             "key_flags": [],
         }
     verdict_label = vr["verdict_label"]
-    action_map_v = {
-        "Мимо": "🔴", "Смотреть": "🟡",
-        "Брать на due diligence": "🟢",
-        "Чисто, но неинтересно по цене": "🟢",
-    }
-    verdict_emoji = action_map_v.get(verdict_label, "⚠️")
+    verdict_emoji = vr.get("risk_level") or "🟡"
 
     an_stub = {
         "price": fmt(lot_price),
@@ -1487,8 +1478,8 @@ async def analyze_lot(lot: dict, light: bool = False) -> dict:
         "owners":         egrn_parsed.get("owner") or expert.get("owners_count", "?"),
         "exit_strategy":  exit_s if exit_s not in ("уточните после проверки документов", "") else "",
         "extra_checks":   "\n".join(extra),
-        "risk_text":      f"{risk_icons.get(rl,'🟡')} риск: {rl}",
-        "invest_text":    f"{invest_icons.get(ip,'📈')} потенциал: {ip}",
+        "risk_text":      f"документы: {vr.get('document_risk_level', 'средний')}",
+        "invest_text":    "",
         "strategy":       strategy,
         "what_to_check":  enrich_what_to_check(
             expert.get("what_to_check", ""), cadastral, address, vin, lot_type),
@@ -1506,7 +1497,10 @@ async def analyze_lot(lot: dict, light: bool = False) -> dict:
         "facts_json": vr["facts_json"],
         "risk_score": vr["risk_score"],
         "risk_level": vr["risk_level"],
-        "invest_score": vr["invest_score"],
+        "invest_score": vr.get("invest_score"),
+        "document_risk_level": vr.get("document_risk_level"),
+        "verdict_pluses": vr.get("verdict_pluses", []),
+        "verdict_minuses": vr.get("verdict_minuses", []),
         "verdict_label": verdict_label,
         "verdict_detail": vr["verdict_detail"],
         "verdict_card": vr["verdict_card"],
