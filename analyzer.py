@@ -375,6 +375,22 @@ def format_egrn_legal_block(egrn: dict) -> str:
     return "\n".join(lines)
 
 
+def apply_appraisal_to_lot(lot: dict, pdf_text: str) -> None:
+    """Парсит отчёт об оценке и дополняет lot."""
+    try:
+        from appraisal_pdf import parse_appraisal_pdf
+    except ImportError:
+        return
+    lot["pdf_from_appraisal"] = True
+    lot["appraisal_pdf_text"] = pdf_text
+    parsed = parse_appraisal_pdf(pdf_text)
+    lot["appraisal_parsed"] = parsed
+    if parsed.get("parsed_ok"):
+        lot["appraisal_read_ok"] = True
+    if parsed.get("restriction_flags"):
+        lot["appraisal_flags"] = parsed["restriction_flags"]
+
+
 def apply_egrn_to_lot(lot: dict, pdf_text: str, from_real_pdf: bool) -> None:
     """Парсит ЕГРН и дополняет lot."""
     lot["pdf_from_egrn"] = from_real_pdf
@@ -399,18 +415,29 @@ def apply_egrn_to_lot(lot: dict, pdf_text: str, from_real_pdf: bool) -> None:
 def resolve_document_status(lot: dict) -> str:
     """Единый статус документов — без выдумок."""
     egrn = lot.get("egrn_parsed") or {}
+    appr = lot.get("appraisal_parsed") or {}
+    parts = []
     if lot.get("egrn_read_ok") or (lot.get("pdf_from_egrn") and egrn.get("parsed_ok")):
-        method = lot.get("egrn_extract_method", "")
-        suffix = " (OCR)" if method == "ocr" else ""
-        return f"Документы проверены (ЕГРН{suffix})"
-    if lot.get("egrn_ocr_failed"):
-        return "не удалось распознать выписку ЕГРН"
+        suffix = " (OCR)" if lot.get("egrn_extract_method") == "ocr" else ""
+        parts.append(f"ЕГРН{suffix}")
+    elif lot.get("egrn_ocr_failed"):
+        parts.append("ЕГРН не распознан")
+    if lot.get("appraisal_read_ok") or appr.get("parsed_ok"):
+        parts.append("отчёт об оценке")
+    n = lot.get("pdfs_downloaded_count") or len(lot.get("pdfs_downloaded") or [])
+    if parts:
+        base = "Документы: " + ", ".join(parts)
+        if n > len(parts):
+            base += f" (+{n - len(parts)} PDF)"
+        return base
     if lot.get("pdf_download_failed"):
         if lot.get("has_egrn_on_site"):
             return "выписка на сайте — не удалось скачать (нужна авторизация)"
         return "документы не получены"
     if lot.get("has_egrn_on_site"):
         return "выписка на сайте — текст не извлечён"
+    if n:
+        return f"скачано PDF: {n}, ключевые поля не распознаны"
     return "Документы не получены"
 
 
@@ -487,6 +514,8 @@ def format_price_line(an: dict) -> str:
         return f"💰 {price} | _рынок не определён — оценить вручную_"
     disc = an.get("discount_pct", "0")
     disc_s = f" (-{disc}%)" if str(disc) not in ("0", "?", "") else ""
+    if an.get("market_source") == "appraisal":
+        return f"💰 {price} → оценка {an.get('market_price', '—')}{disc_s} _из отчёта_"
     if an.get("market_source") == "search":
         return f"💰 {price} → ориентир {an.get('market_price', '—')}{disc_s} _проверить_"
     return f"💰 {price} → рынок {an.get('market_price', '—')}{disc_s}"
@@ -1059,8 +1088,11 @@ async def analyze_lot(lot: dict, light: bool = False) -> dict:
         lot.update(land)
         red_flags = scan_red_flags(full_text_src, lot_type)
         red_flags = list(dict.fromkeys(red_flags + lot.get("land_flags", [])))
+        red_flags = list(dict.fromkeys(red_flags + (lot.get("appraisal_flags") or [])))
     else:
         red_flags = scan_red_flags(full_text_src, lot_type) if is_real_estate(lot_type) else []
+        if lot.get("appraisal_flags"):
+            red_flags = list(dict.fromkeys(red_flags + lot["appraisal_flags"]))
 
     if lot_price == 0:
         src = egrn_pdf or page_text
@@ -1096,31 +1128,52 @@ async def analyze_lot(lot: dict, light: bool = False) -> dict:
                     area_sqm = float(am.group(1).replace(",", "."))
                 except ValueError:
                     area_sqm = 0
-        orient = {"found": False, "comment": "рынок не определён"}
-        try:
-            from market_search import fetch_market_orientir
-            orient = await fetch_market_orientir(
-                lot_type, lot.get("address", ""), area_sqm, region, title,
-            )
-        except Exception as e:
-            log.warning("market_search unavailable: %s", e)
-        if orient.get("found"):
+        appr = lot.get("appraisal_parsed") or {}
+        appr_price = (
+            appr.get("market_price")
+            or appr.get("appraisal_price")
+            or appr.get("liquidation_price")
+            or 0
+        )
+        if appr_price and appr_price > 0:
+            comment = appr.get("summary") or "ориентир из отчёта об оценке"
+            if appr.get("comparables_range", "не указано") != "не указано":
+                comment += f"; аналоги: {appr['comparables_range']}"
             mkt = {
-                "market_price": orient["market_price"],
+                "market_price": appr_price,
                 "rental_monthly": 0,
-                "price_per_sqm": orient.get("price_per_sqm", 0),
+                "price_per_sqm": int(appr_price / area_sqm) if area_sqm else 0,
                 "area": area_sqm,
-                "comment": orient["comment"],
+                "comment": comment,
                 "manual_market": False,
-                "market_source": "search",
+                "market_source": "appraisal",
             }
         else:
-            mkt = {
-                "market_price": 0, "rental_monthly": 0, "price_per_sqm": 0,
-                "area": area_sqm,
-                "comment": orient.get("comment", "рынок не определён"),
-                "manual_market": True,
-            }
+            orient = {"found": False, "comment": "рынок не определён"}
+            try:
+                from market_search import fetch_market_orientir
+                orient = await fetch_market_orientir(
+                    lot_type, lot.get("address", ""), area_sqm, region, title,
+                )
+            except Exception as e:
+                log.warning("market_search unavailable: %s", e)
+            if orient.get("found"):
+                mkt = {
+                    "market_price": orient["market_price"],
+                    "rental_monthly": 0,
+                    "price_per_sqm": orient.get("price_per_sqm", 0),
+                    "area": area_sqm,
+                    "comment": orient["comment"],
+                    "manual_market": False,
+                    "market_source": "search",
+                }
+            else:
+                mkt = {
+                    "market_price": 0, "rental_monthly": 0, "price_per_sqm": 0,
+                    "area": area_sqm,
+                    "comment": orient.get("comment", "рынок не определён"),
+                    "manual_market": True,
+                }
     mkt_prc = mkt["market_price"]
     market_known = not mkt.get("manual_market") and mkt_prc > 0
 
