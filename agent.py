@@ -4,7 +4,7 @@
 - Фаза 2: PDF ЕГРН + Groq только для топ-кандидатов
 - Таймауты на операции; частичный дайджест при нехватке времени
 """
-import os, asyncio, schedule, time, pdfplumber, io, re
+import os, asyncio, schedule, time, pdfplumber, io, re, logging
 from datetime import datetime
 from dotenv import load_dotenv
 from playwright.async_api import async_playwright
@@ -16,11 +16,35 @@ from analyzer import (analyze_lot, detect_type, get_lot_details, MIN_SCORE, MIN_
 from database import init_db, record_digest_lot, save_agent_run
 
 load_dotenv()
+log = logging.getLogger("agent")
 
 LOGIN    = os.getenv("TBANKROT_LOGIN")
 PASSWORD = os.getenv("TBANKROT_PASSWORD")
 TG_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TG_CHAT  = os.getenv("TELEGRAM_CHAT_ID")
+
+_CHROMIUM_ARGS = [
+    "--no-sandbox",
+    "--disable-setuid-sandbox",
+    "--disable-dev-shm-usage",
+    "--disable-gpu",
+]
+
+
+def ensure_playwright_env() -> None:
+    os.environ.setdefault("PLAYWRIGHT_SKIP_VALIDATE_HOST_REQUIREMENTS", "1")
+
+
+async def launch_browser(playwright):
+    """Chromium для Railway/Docker: без sandbox + пропуск проверки host deps."""
+    ensure_playwright_env()
+    try:
+        browser = await playwright.chromium.launch(headless=True, args=_CHROMIUM_ARGS)
+        log.info("Chromium launched")
+        return browser
+    except Exception:
+        log.exception("Chromium launch failed")
+        raise
 
 REGIONS_MAIN  = ["moskva", "moskovskaya-oblast"]
 REGIONS_EXTRA = ["sankt-peterburg","krasnodar","ekaterinburg","novosibirsk"]
@@ -96,14 +120,19 @@ def _apply_details(lot, details):
 
 
 async def login(page) -> bool:
-    if not LOGIN or not PASSWORD:
+    login_set = bool(LOGIN and LOGIN.strip())
+    pwd_set = bool(PASSWORD and PASSWORD.strip())
+    log.info("[login] TBANKROT_LOGIN set=%s TBANKROT_PASSWORD set=%s", login_set, pwd_set)
+    if not login_set or not pwd_set:
+        log.warning("[login] skip: credentials missing in env")
         return False
     try:
         await page.goto("https://tbankrot.ru/", timeout=30000)
         await page.wait_for_timeout(2000)
         if await page.locator("text=Выйти").count():
-            print("[login] OK already")
+            log.info("[login] OK — already logged in")
             return True
+        log.info("[login] opening login modal")
         await page.click("text=Войти", timeout=8000)
         await page.wait_for_timeout(1500)
         for tab in ("Email", "E-mail", "Почта", "email"):
@@ -112,6 +141,7 @@ async def login(page) -> bool:
                 if await t.count() and await t.is_visible():
                     await t.click()
                     await page.wait_for_timeout(400)
+                    log.info("[login] tab selected: %s", tab)
                     break
             except Exception:
                 pass
@@ -119,35 +149,59 @@ async def login(page) -> bool:
         await page.wait_for_selector(email_sel, timeout=8000)
         await page.fill(email_sel, LOGIN)
         await page.wait_for_timeout(400)
-        try:
-            await page.locator("input[type='password']:visible").first.fill(PASSWORD, timeout=5000)
-        except Exception:
+        pwd_filled = False
+        for sel in (
+            "[role='dialog'] input[type='password']",
+            "form input[type='password']",
+            "input[type='password']:visible",
+        ):
+            try:
+                loc = page.locator(sel).first
+                if await loc.count():
+                    await loc.fill(PASSWORD, timeout=5000)
+                    pwd_filled = True
+                    log.info("[login] password filled via %s", sel)
+                    break
+            except Exception as e:
+                log.debug("[login] password selector %s: %s", sel, e)
+        if not pwd_filled:
             await page.locator("input[type='password']").first.fill(PASSWORD, force=True)
+            log.info("[login] password filled via force")
         await page.wait_for_timeout(400)
+        clicked = False
         for btn in await page.query_selector_all("button"):
             if (await btn.inner_text()).strip() == "Войти":
                 await btn.click()
+                clicked = True
                 break
+        if not clicked:
+            log.warning("[login] submit button not found")
         await page.wait_for_timeout(3500)
         if await page.locator("text=Выйти").count():
-            print("[login] OK")
+            log.info("[login] OK — logout link visible")
             return True
         await page.goto("https://tbankrot.ru/", timeout=20000)
         await page.wait_for_timeout(1500)
         ok = await page.locator("text=Выйти").count() > 0
         if not ok:
             ok = await page.locator("text=Войти").count() == 0
+        cookies = await page.context.cookies()
         if not ok:
-            cookies = await page.context.cookies()
             ok = any(
                 c.get("name", "").lower() in ("session", "sessionid", "auth", "token", "jwt")
                 or "session" in c.get("name", "").lower()
                 for c in cookies
             )
-        print("[login] OK" if ok else "[login] NOT CONFIRMED")
+        if ok:
+            log.info("[login] OK — session confirmed (cookies=%d)", len(cookies))
+        else:
+            log.warning(
+                "[login] NOT CONFIRMED — no logout link; cookie names: %s",
+                [c.get("name") for c in cookies[:12]],
+            )
         return ok
-    except Exception as e:
-        print(f"[login] FAIL: {e}")
+    except Exception:
+        log.exception("[login] FAIL")
         return False
 
 
@@ -563,7 +617,7 @@ async def run(cats=None, include_extra=True, daily=True, *,
         regions += REGIONS_EXTRA
 
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
+        browser = await launch_browser(p)
         ctx = await browser.new_context(user_agent=(
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
             "AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36"
