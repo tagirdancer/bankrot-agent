@@ -528,9 +528,28 @@ def detect_type(text: str) -> str:
     return "прочее"
 
 
-async def download_pdf(lot_id: str) -> str:
+def _extract_pdf_text_safe(raw: bytes) -> tuple[str, str]:
     try:
         from egrn_pdf import extract_pdf_text
+        return extract_pdf_text(raw)
+    except ImportError:
+        pass
+    except Exception as e:
+        log.debug("egrn_pdf extract: %s", e)
+    try:
+        import pdfplumber
+        with pdfplumber.open(io.BytesIO(raw)) as pdf:
+            parts = [(p.extract_text() or "") for p in pdf.pages[:8]]
+        text = "\n".join(parts).strip()
+        if len(text) > 80:
+            return text, "text"
+    except Exception as e:
+        log.debug("pdfplumber extract: %s", e)
+    return "", "failed"
+
+
+async def download_pdf(lot_id: str) -> str:
+    try:
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
             "Referer":    "https://tbankrot.ru/",
@@ -547,7 +566,7 @@ async def download_pdf(lot_id: str) -> str:
                 try:
                     resp = await client.get(url, headers=headers)
                     if resp.status_code == 200 and b"%PDF" in resp.content[:10]:
-                        text, method = extract_pdf_text(resp.content)
+                        text, method = _extract_pdf_text_safe(resp.content)
                         if text and len(text) > 80:
                             print(f"    📄 PDF ({method}, {len(text)} симв.)")
                             return text
@@ -1008,7 +1027,6 @@ async def analyze_lot(lot: dict, light: bool = False) -> dict:
             "comment": "", "area": lot.get("area_sqm") or 0,
         }
     else:
-        from market_search import fetch_market_orientir
         area_sqm = lot.get("area_sqm") or 0
         if not area_sqm:
             src_area = f"{title} {page_text} {egrn_pdf}"
@@ -1018,9 +1036,14 @@ async def analyze_lot(lot: dict, light: bool = False) -> dict:
                     area_sqm = float(am.group(1).replace(",", "."))
                 except ValueError:
                     area_sqm = 0
-        orient = await fetch_market_orientir(
-            lot_type, lot.get("address", ""), area_sqm, region, title,
-        )
+        orient = {"found": False, "comment": "рынок не определён"}
+        try:
+            from market_search import fetch_market_orientir
+            orient = await fetch_market_orientir(
+                lot_type, lot.get("address", ""), area_sqm, region, title,
+            )
+        except Exception as e:
+            log.warning("market_search unavailable: %s", e)
         if orient.get("found"):
             mkt = {
                 "market_price": orient["market_price"],
