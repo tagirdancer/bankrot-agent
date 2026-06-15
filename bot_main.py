@@ -359,30 +359,42 @@ async def fetch_and_analyze_lot(lot_id: str):
 
 
 async def deep_analysis(lot_id: str, facts: dict = None) -> str:
-    """Полный анализ — детерминированный вердикт без LLM (анти-галлюцинации)."""
+    """Полный анализ — детерминированный вердикт; не падает целиком при ошибке шага."""
     import json
     from analyzer import build_verification_links
-    from verdict import run_verdict_pipeline
 
     facts = facts or {}
     url = f"https://tbankrot.ru/item?id={lot_id}"
     cached = lot_cache.get(lot_id, {})
     lot = cached.get("lot") or {"id": lot_id, "url": url}
-    an = cached.get("an")
+    an = cached.get("an") or {}
 
-    if an and an.get("verdict_card"):
-        card = an["verdict_card"]
-        facts_json = an.get("facts_json", {})
-    else:
-        partial = {
-            "lot_price_raw": facts.get("price_raw") or lot.get("price"),
-            "market_price_raw": facts.get("market_raw"),
-            "discount_pct": facts.get("disc", "0"),
-            "land_manual_market": lot.get("category") == "земля",
-        }
-        vr = run_verdict_pipeline(lot, partial)
-        card = vr["verdict_card"]
-        facts_json = vr["facts_json"]
+    card = ""
+    facts_json: dict = {}
+
+    try:
+        if an.get("verdict_card"):
+            card = an["verdict_card"]
+            facts_json = an.get("facts_json") or {}
+        else:
+            from verdict import run_verdict_pipeline
+            partial = {
+                "lot_price_raw": facts.get("price_raw") or lot.get("price"),
+                "market_price_raw": facts.get("market_raw"),
+                "discount_pct": facts.get("disc", "0"),
+                "land_manual_market": lot.get("category") == "земля",
+                "market_known": bool(facts.get("market_raw")),
+            }
+            vr = run_verdict_pipeline(lot, partial)
+            card = vr.get("verdict_card") or ""
+            facts_json = vr.get("facts_json") or {}
+    except Exception:
+        log.exception("deep_analysis verdict failed lot=%s", lot_id)
+        card = card or (
+            "*Вердикт по документам*\n\n"
+            "Частичный результат: вердикт не собран полностью. "
+            "Смотрите короткую карточку и документы на сайте."
+        )
 
     parsed_hdr = ""
     pts = facts.get("parsed_at") or cached.get("parsed_at")
@@ -397,20 +409,44 @@ async def deep_analysis(lot_id: str, facts: dict = None) -> str:
 
     cadastral = facts.get("cadastral") or cached.get("cadastral", "")
     address = facts.get("address") or cached.get("address", "")
-    lot_type = lot.get("category") or (an or {}).get("lot_type", "")
+    lot_type = lot.get("category") or an.get("lot_type", "")
     vin = lot.get("vin") or ""
-    verify_links = build_verification_links(cadastral, address, vin, lot_type)
 
-    clean_facts = {k: v for k, v in facts_json.items() if not str(k).startswith("_")}
-    json_block = json.dumps(clean_facts, ensure_ascii=False, indent=2)
+    try:
+        verify_links = build_verification_links(cadastral, address, vin, lot_type)
+    except Exception:
+        log.exception("deep_analysis verify links failed lot=%s", lot_id)
+        verify_links = "Ссылки для проверки не сформированы."
+
+    try:
+        clean_facts = {
+            k: v for k, v in (facts_json or {}).items()
+            if not str(k).startswith("_")
+        }
+        json_block = json.dumps(clean_facts, ensure_ascii=False, indent=2, default=str)
+        if len(json_block) > 2500:
+            json_block = json_block[:2500] + "\n… (обрезано)"
+    except Exception:
+        log.exception("deep_analysis json dump failed lot=%s", lot_id)
+        json_block = "{}"
 
     parts = []
     if parsed_hdr:
         parts.append(f"📅 Данные спарсены: {parsed_hdr}\n")
-    parts.append(card)
+    parts.append(card or "Вердикт не сформирован — данных недостаточно.")
     parts.append(f"\n*Извлечённые факты (шаг 1):*\n```\n{json_block}\n```")
     parts.append(f"\n*Ссылки для ручной проверки:*\n{verify_links}")
     return "\n".join(parts)
+
+
+def _split_telegram_message(text: str, limit: int = 4000) -> list[str]:
+    if len(text) <= limit:
+        return [text]
+    chunks: list[str] = []
+    while text:
+        chunks.append(text[:limit])
+        text = text[limit:]
+    return chunks
 
 
 # Хранилище выбранного региона
@@ -537,14 +573,24 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await q.answer("Анализирую...")
             await q.message.reply_text("🔍 Готовлю вердикт по лоту (~1 мин)...")
             analysis = await deep_analysis(lot_id, facts)
-            try:
-                await q.message.reply_text(analysis, parse_mode="Markdown")
-            except Exception:
-                log.exception("full_analysis failed: ошибка отправки с Markdown, шлю без форматирования")
-                await q.message.reply_text(analysis)
+            for chunk in _split_telegram_message(analysis):
+                try:
+                    await q.message.reply_text(chunk, parse_mode="Markdown")
+                except Exception:
+                    log.exception("full_analysis markdown send failed lot=%s", lot_id)
+                    await q.message.reply_text(chunk)
         except Exception:
-            log.exception("full_analysis failed")
-            await q.message.reply_text("\u26a0\ufe0f Не удалось получить анализ (внутренняя ошибка). Подробности в логах Railway.")
+            log.exception("full_analysis failed lot=%s", lot_id)
+            try:
+                partial = await deep_analysis(lot_id, facts)
+                for chunk in _split_telegram_message(partial):
+                    await q.message.reply_text(chunk)
+            except Exception:
+                log.exception("full_analysis fallback failed lot=%s", lot_id)
+                await q.message.reply_text(
+                    "⚠️ Полный анализ частично недоступен. "
+                    "Смотрите короткую карточку выше и документы на сайте."
+                )
         return
 
     if data == "latest":
@@ -720,8 +766,9 @@ def run():
     ensure_playwright_env()
     init_db()
     try:
-        from egrn_pdf import ocr_available
-        log.info("OCR startup: available=%s", ocr_available())
+        from egrn_pdf import ocr_status
+        ok, reason = ocr_status()
+        log.info("OCR startup: available=%s reason=%s", ok, reason)
     except Exception as e:
         log.warning("OCR startup check failed: %s", e)
     app = Application.builder().token(TG_TOKEN).build()
