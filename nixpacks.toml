@@ -1,4 +1,11 @@
-# Install Chromium after default Python/pip install (do not override install phase).
+# Chromium for Playwright (avoid --with-deps: breaks on Ubuntu Noble libasound2).
+[phases.setup]
+aptPkgs = [
+  "libnss3", "libatk1.0-0", "libatk-bridge2.0-0", "libcups2", "libdrm2",
+  "libxkbcommon0", "libxcomposite1", "libxdamage1", "libxrandr2", "libgbm1",
+  "libasound2t64", "libpango-1.0-0", "libcairo2", "fonts-liberation",
+]
+
 [phases.playwright]
 dependsOn = ["install"]
-cmds = ["playwright install --with-deps chromium"]
+cmds = ["playwright install chromium"]
