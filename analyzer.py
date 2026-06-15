@@ -173,7 +173,11 @@ def format_short_lot_message(lot: dict, an: dict, label: str = "ЛОТ") -> str:
     if an.get("lot_type") == "авто" and an.get("auto_summary"):
         lines.append(f"🚗 {an['auto_summary']}")
     elif an.get("legal_text"):
-        lines.append(f"📋 {an['legal_text'][:140]}")
+        lt = an["legal_text"]
+        if an.get("encumbrances"):
+            lines.append(f"🔒 {an['encumbrances'][:100]}")
+        else:
+            lines.append(f"📋 {lt[:120]}")
     if an.get("document_risk_level"):
         asc = an.get("assessment_score")
         if asc is not None:
@@ -229,55 +233,113 @@ def is_real_estate(lot_type: str) -> bool:
     return lot_type in ("квартира", "апартаменты", "дом", "коммерция", "земля", "гараж")
 
 
+_ENC_GARBAGE_RE = re.compile(
+    r"аукцион|завершен|открытый\s+аук|аренда\s+нежил|"
+    r"\d[\d\s]{2,}[,.]\d{2}\s*(?:₽|руб)?|"
+    r"кадастров[^\n]{0,15}номер|\bкв\.?\s*м\b",
+    re.I,
+)
+
+_ENC_KNOWN = (
+    (r"ипотека\s+в\s+силу\s+закона", "Ипотека в силу закона"),
+    (r"запрещени[^\n]{0,30}регистрац", "Запрещение регистрации"),
+    (r"ограничени[яе]\s+прав[^\n]{0,50}стать[^\n]{0,20}\d+", None),
+    (r"\bарест\b", "Арест"),
+    (r"\bзалог\b", "Залог"),
+    (r"\bсервитут\b", "Сервитут"),
+)
+
+
+def _clean_field_text(text: str, max_len: int = 100) -> str:
+    if not text:
+        return ""
+    s = re.sub(r"\s{2,}", " ", str(text).strip())
+    s = re.sub(r"^\(обременения\)\s*:\s*", "", s, flags=re.I)
+    s = re.sub(r"^вид\s+(?:обременени|ограничени)[яь]\s*:\s*", "", s, flags=re.I)
+    if _ENC_GARBAGE_RE.search(s):
+        return ""
+    return s[:max_len].strip(" ;,")
+
+
+def _egrn_encumbrance_sections(norm: str) -> str:
+    chunks: list[str] = []
+    for pat in (
+        r"Сведения о зарегистрир[^\n]*обременен[^\n]*\n([\s\S]{5,1500}?)"
+        r"(?:\n\s*\d+[.)]\s|\nСведения |\Z)",
+        r"Сведения об ограничениях прав[^\n]*\n([\s\S]{5,1500}?)"
+        r"(?:\n\s*\d+[.)]\s|\nСведения |\Z)",
+    ):
+        for m in re.finditer(pat, norm, re.I):
+            chunks.append(m.group(1))
+    return "\n".join(chunks)
+
+
+def _summarize_egrn_encumbrances(lot: dict) -> str:
+    records = list(lot.get("egrn_records") or [])
+    if not records:
+        egrn = lot.get("egrn_parsed") or {}
+        return _clean_field_text(egrn.get("encumbrances") or "", 100)
+    parts: list[str] = []
+    for rec in records:
+        enc = _clean_field_text(rec.get("encumbrances") or "", 100)
+        if not enc or enc == "не указано в распознанном тексте":
+            continue
+        cad = rec.get("cadastral") or "?"
+        parts.append(f"{cad}: {enc}" if enc != "обременений не зарегистрировано" else f"{cad}: нет")
+    return "; ".join(parts)[:120]
+
+
 def _extract_encumbrances_detail(norm: str) -> tuple[str, bool]:
-    """Конкретная формулировка обременений из текста ЕГРН."""
-    tl = norm.lower()
+    """Короткая формулировка обременений — только из раздела ЕГРН."""
+    enc_blob = _egrn_encumbrance_sections(norm)
+    check = enc_blob if enc_blob.strip() else norm[:5000]
+    ctl = check.lower()
+
     if re.search(
         r"нет\s+зарегистрированных\s+обремен|"
         r"обременени[яе][^\n]{0,40}не\s+зарегистрир|"
         r"сведения\s+об\s+отсутствии\s+обремен|"
         r"не\s*зарегистрировано",
-        tl,
+        ctl,
     ):
-        if re.search(r"ограничени[^\n]{0,80}стать[^\n]{0,30}\d", tl):
-            pass
-        elif re.search(r"(?:вид|тип)\s*(?:обременени|ограничени)[^\n]{8,}", norm, re.I):
-            pass
-        else:
-            return "обременений не зарегистрировано", True
+        if not re.search(r"ограничени[^\n]{0,80}стать[^\n]{0,30}\d", ctl):
+            if not re.search(
+                r"(?:вид|тип)\s*(?:обременени|ограничени)[^\n]{8,}", check, re.I,
+            ):
+                return "обременений не зарегистрировано", True
 
-    phrases: list[str] = []
-    enc_section = re.search(
-        r"Сведения об ограничениях прав[^\n]*\n([\s\S]{20,2000}?)(?:\n\s*\d+\.\s|\nСведения о|\Z)",
-        norm, re.I,
-    )
-    src = enc_section.group(1) if enc_section else norm
+    found: list[str] = []
 
-    for pat in [
-        r"(ипотек[^\n]{0,100}(?:в\s+силу\s+закона|с\s+банком|[^\n]{0,40}))",
-        r"вид\s+обременени[яь][:\s]+([^\n]{5,140})",
-        r"вид\s+ограничени[яь][:\s]+([^\n]{5,140})",
-        r"(ограничени[яе]\s+прав[^\n]{0,120})",
-        r"(залог[^\n]{5,100})",
-        r"(сервитут[^\n]{5,80})",
-        r"(аренд[^\n]{5,80})",
-    ]:
-        for m in re.finditer(pat, src, re.I):
-            p = re.sub(r"\s{2,}", " ", (m.group(1) if m.lastindex else m.group(0)).strip())
-            p = p.strip(" :;,")
-            if len(p) > 8 and p.lower() not in {x.lower() for x in phrases}:
-                phrases.append(p[:140])
+    def _add(phrase: str) -> None:
+        p = _clean_field_text(phrase, 100)
+        if p and len(p) >= 3 and p.lower() not in {x.lower() for x in found}:
+            found.append(p)
 
-    if phrases:
-        return "; ".join(phrases[:4])[:280], False
+    search = enc_blob if enc_blob.strip() else ""
+    if search:
+        for pat, label in _ENC_KNOWN:
+            m = re.search(pat, search, re.I)
+            if m:
+                _add(label if label else m.group(0))
+        for m in re.finditer(
+            r"(?:вид\s+обременени[яь]|вид\s+ограничени[яь])[:\s]+([^\n]{3,90})",
+            search, re.I,
+        ):
+            _add(m.group(1))
+    else:
+        for m in re.finditer(
+            r"(?:вид\s+обременени[яь]|вид\s+ограничени[яь])[:\s]+([^\n]{3,90})",
+            norm[:8000], re.I,
+        ):
+            _add(m.group(1))
+        if re.search(r"ипотека\s+в\s+силу\s+закона", norm[:8000], re.I):
+            _add("Ипотека в силу закона")
 
-    if re.search(r"ограничени[^\n]{0,30}прав[^\n]{0,80}стать", tl):
-        m = re.search(r"(ограничени[^\n]{0,120}стать[^\n]{0,40})", norm, re.I)
-        if m:
-            return re.sub(r"\s{2,}", " ", m.group(1).strip())[:200], False
+    if found:
+        return ", ".join(found[:4])[:100], False
 
-    if re.search(r"ипотек|залог|арест|сервитут", tl):
-        return "упоминание обременения без расшифровки — проверить выписку", False
+    if enc_blob.strip() and re.search(r"ипотек|залог|арест|сервитут|запрещени", ctl):
+        return "обременение указано — проверить выписку", False
 
     return "не указано в распознанном тексте", False
 
@@ -416,7 +478,7 @@ def _format_single_egrn_block(egrn: dict) -> str:
     if egrn.get("share"):
         lines.append(f"Доля: {egrn['share']}")
     if egrn.get("encumbrances"):
-        lines.append(f"Обременения: {egrn['encumbrances'][:160]}")
+        lines.append(f"Обременения: {_clean_field_text(egrn['encumbrances'], 100)}")
     if egrn.get("arrests"):
         lines.append(f"Аресты: {egrn['arrests'][:120]}")
     return "\n".join(lines)
@@ -427,19 +489,23 @@ def apply_appraisal_to_lot(lot: dict, pdf_text: str, method: str = "", source_ti
     try:
         from appraisal_pdf import parse_appraisal_pdf
     except ImportError:
+        log.warning("appraisal_pdf unavailable")
         return
-    lot["pdf_from_appraisal"] = True
-    lot["appraisal_pdf_text"] = pdf_text
-    parsed = parse_appraisal_pdf(pdf_text)
-    if method:
-        parsed["extract_method"] = method
-    if source_title:
-        parsed["source_title"] = source_title
-    lot["appraisal_parsed"] = parsed
-    if parsed.get("parsed_ok"):
-        lot["appraisal_read_ok"] = True
-    if parsed.get("restriction_flags"):
-        lot["appraisal_flags"] = parsed["restriction_flags"]
+    try:
+        lot["pdf_from_appraisal"] = True
+        lot["appraisal_pdf_text"] = pdf_text
+        parsed = parse_appraisal_pdf(pdf_text)
+        if method:
+            parsed["extract_method"] = method
+        if source_title:
+            parsed["source_title"] = source_title
+        lot["appraisal_parsed"] = parsed
+        if parsed.get("parsed_ok"):
+            lot["appraisal_read_ok"] = True
+        if parsed.get("restriction_flags"):
+            lot["appraisal_flags"] = parsed["restriction_flags"]
+    except Exception:
+        log.exception("apply_appraisal_to_lot failed for lot %s", lot.get("id", ""))
 
 
 def _merge_egrn_records(records: list[dict]) -> dict:
@@ -1319,7 +1385,9 @@ async def analyze_lot(lot: dict, light: bool = False) -> dict:
         encumb_from_egrn = ""
     elif egrn_parsed.get("parsed_ok"):
         legal_text = format_egrn_legal_block(egrn_parsed)
-        encumb_from_egrn = egrn_parsed.get("encumbrances", "")
+        encumb_from_egrn = _summarize_egrn_encumbrances(lot) or _clean_field_text(
+            egrn_parsed.get("encumbrances", ""), 100,
+        )
     elif lot.get("egrn_ocr_failed"):
         legal_text = ""
         encumb_from_egrn = ""
@@ -1367,6 +1435,14 @@ async def analyze_lot(lot: dict, light: bool = False) -> dict:
             )
         except asyncio.TimeoutError:
             log.warning("Groq timeout %.0fs для лота %s", groq_timeout, lot.get("id", ""))
+            expert = expert_fallback(
+                title, lot_type, lot_price, mkt_prc if market_known else 0,
+                disc_pct if market_known else 0, parts_n, score,
+                cadastral if is_real_estate(lot_type) else "", vin, full_text,
+                has_docs=has_docs,
+            )
+        except Exception:
+            log.exception("Groq failed for lot %s", lot.get("id", ""))
             expert = expert_fallback(
                 title, lot_type, lot_price, mkt_prc if market_known else 0,
                 disc_pct if market_known else 0, parts_n, score,
@@ -1446,7 +1522,7 @@ async def analyze_lot(lot: dict, light: bool = False) -> dict:
         extra.append("Риски (Groq): " + " | ".join(str(r) for r in valid_risks[:2]))
     if market_known and valid_opps:
         extra.append("Факты (Groq): " + " | ".join(str(o) for o in valid_opps[:2]))
-    encumb = expert.get("encumbrances", "") or encumb_from_egrn or ""
+    encumb = encumb_from_egrn or _clean_field_text(expert.get("encumbrances", "") or "", 100)
     exit_s = expert.get("exit_strategy", "") or ""
     strategy = expert.get("strategy", "")
     if not market_known and "Дисконт" in strategy:
