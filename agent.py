@@ -4,7 +4,7 @@
 - Фаза 2: PDF ЕГРН + Groq только для топ-кандидатов
 - Таймауты на операции; частичный дайджест при нехватке времени
 """
-import os, asyncio, schedule, time, pdfplumber, io, re, logging
+import os, asyncio, schedule, time, pdfplumber, io, re, logging, json
 from datetime import datetime
 from dotenv import load_dotenv
 from playwright.async_api import async_playwright
@@ -59,7 +59,7 @@ FLUSH_BEFORE_SEC  = int(os.getenv("AGENT_FLUSH_SEC", "300"))
 LOT_TIMEOUT_LIGHT = int(os.getenv("LOT_TIMEOUT_LIGHT", "12"))
 LOT_TIMEOUT_HEAVY = int(os.getenv("LOT_TIMEOUT_HEAVY", "45"))
 MAX_HEAVY_LOTS    = int(os.getenv("AGENT_MAX_HEAVY", "45"))
-PDF_TIMEOUT       = int(os.getenv("PDF_TIMEOUT", "12"))
+PDF_TIMEOUT       = int(os.getenv("PDF_TIMEOUT", "90"))
 HEAVY_MIN_SCORE   = float(os.getenv("AGENT_HEAVY_MIN_SCORE", str(max(MIN_SCORE, 6.5))))
 
 CATEGORIES = {
@@ -181,6 +181,14 @@ async def _do_login_submit(page) -> tuple[bool, str]:
             await page.reload(wait_until="domcontentloaded")
             await page.wait_for_timeout(2500)
             return True, "ajax_success"
+        try:
+            data = json.loads(body)
+            if isinstance(data, dict) and data.get("auth") in (1, "1", True):
+                await page.reload(wait_until="domcontentloaded")
+                await page.wait_for_timeout(2500)
+                return True, "ajax_auth_ok"
+        except (json.JSONDecodeError, TypeError):
+            pass
         hints = {
             "badMail": "invalid_email",
             "badPas": "invalid_password",
@@ -356,25 +364,49 @@ async def login(page) -> bool:
         return False
 
 
-async def _fetch_pdf_bytes(page, url: str) -> bytes:
-    """Скачивает PDF с cookies сессии браузера (ctx.request без login → 403)."""
+async def _fetch_file_bytes(page, ctx, url: str, referer: str = "") -> tuple[bytes, int]:
+    """Скачивает файл с cookies сессии. Возвращает (bytes, http_status)."""
+    referer = referer or getattr(page, "url", None) or "https://tbankrot.ru/"
+    if ctx:
+        try:
+            resp = await ctx.request.get(
+                url,
+                headers={
+                    "Referer": referer,
+                    "User-Agent": (
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+                    ),
+                },
+            )
+            if resp.status == 200:
+                return await resp.body(), resp.status
+            if resp.status in (403, 404):
+                return b"", resp.status
+        except Exception as e:
+            log.debug("ctx.request %s: %s", url, e)
+
     try:
         data = await page.evaluate(
             """async (url) => {
                 const r = await fetch(url, {credentials: 'include'});
                 if (!r.ok) return {ok: false, status: r.status};
                 const buf = await r.arrayBuffer();
-                return {ok: true, bytes: Array.from(new Uint8Array(buf))};
+                return {ok: true, status: r.status, bytes: Array.from(new Uint8Array(buf))};
             }""",
             url,
         )
         if data and data.get("ok") and data.get("bytes"):
-            return bytes(data["bytes"])
-        if data and data.get("status") in (403, 404):
-            return b""
+            return bytes(data["bytes"]), int(data.get("status") or 200)
+        return b"", int((data or {}).get("status") or 0)
     except Exception:
-        pass
-    return b""
+        return b"", 0
+
+
+async def _fetch_pdf_bytes(page, url: str) -> bytes:
+    """Legacy: PDF через fetch в странице."""
+    raw, _ = await _fetch_file_bytes(page, None, url)
+    return raw
 
 
 def _legacy_discover_pdf_urls(lot_id: str) -> list:
@@ -398,7 +430,133 @@ def _legacy_extract_pdf_text(raw: bytes) -> tuple[str, str]:
 
 
 async def _try_lot_pdfs(lot, page, ctx):
-    """Скачивает все PDF лота, классифицирует и парсит ЕГРН + отчёт об оценке."""
+    """Скачивает и разбирает все документы лота (PDF, DOCX, фото)."""
+    from analyzer import apply_egrn_to_lot, apply_appraisal_to_lot, apply_lot_document
+    extract_pdf_text = None
+    try:
+        from egrn_pdf import extract_pdf_text
+        from lot_documents import (
+            discover_lot_documents, classify_document, extract_docx_text,
+            parse_document_content, IMAGE_EXTS, READABLE_EXTS,
+        )
+    except ImportError as e:
+        log.warning("Document modules unavailable: %s", e)
+        return await _try_lot_pdfs_legacy(lot, page, ctx)
+
+    lot_url = lot.get("url") or f"https://tbankrot.ru/item?id={lot['id']}"
+    html = ""
+    try:
+        await page.goto(lot_url, timeout=25000, wait_until="domcontentloaded")
+        await page.wait_for_timeout(1500)
+        html = await page.content()
+    except Exception as e:
+        log.warning("lot page reload for documents failed: %s", e)
+        try:
+            html = await page.content()
+        except Exception:
+            pass
+
+    doc_refs = discover_lot_documents(html, lot["id"])
+    lot["document_urls_found"] = [d["url"] for d in doc_refs]
+    lot["has_documents_on_site"] = bool(doc_refs)
+    lot["has_egrn_on_site"] = lot["has_documents_on_site"] or any(
+        x in (html or "").lower() for x in ("егрн", "egrn", "выписк", "оценк", "договор", "заявк")
+    )
+
+    downloaded: list[dict] = []
+    got_readable = False
+
+    for ref in doc_refs:
+        url = ref["url"]
+        title = ref.get("title") or ""
+        ext = ref.get("ext") or ""
+        entry: dict = {
+            "url": url, "title": title, "ext": ext,
+            "bytes": 0, "download_ok": False, "type": "other",
+            "method": "", "text_len": 0, "extracted": {},
+        }
+        try:
+            if ext in IMAGE_EXTS or (not ext and "etpphoto" in url.lower()):
+                entry["type"] = "photo"
+                entry["ext"] = ext or "jpg"
+                raw, status = await _fetch_file_bytes(page, ctx, url, lot_url)
+                entry["bytes"] = len(raw)
+                entry["download_ok"] = len(raw) > 1000
+                entry["extracted"] = {"summary": "есть фото" if entry["download_ok"] else "не скачано"}
+                lot["has_photos"] = lot.get("has_photos") or entry["download_ok"]
+                downloaded.append(entry)
+                continue
+
+            raw, status = await _fetch_file_bytes(page, ctx, url, lot_url)
+            entry["bytes"] = len(raw)
+            entry["download_ok"] = len(raw) > 200
+            if not entry["download_ok"]:
+                log.debug("doc skip %s status=%s bytes=%d", url, status, len(raw))
+                downloaded.append(entry)
+                continue
+
+            text, method = "", "failed"
+            if ext in ("docx", "doc") or raw[:2] == b"PK":
+                text, method = extract_docx_text(raw)
+                entry["ext"] = "docx"
+            elif ext == "pdf" or raw[:4] == b"%PDF":
+                if extract_pdf_text:
+                    text, method = extract_pdf_text(raw)
+                else:
+                    text, method = _legacy_extract_pdf_text(raw)
+                entry["ext"] = "pdf"
+            elif raw[:4] == b"%PDF":
+                text, method = extract_pdf_text(raw) if extract_pdf_text else _legacy_extract_pdf_text(raw)
+            else:
+                # HTML-ответ get_doc.php и прочее
+                if raw.lstrip()[:15].lower().startswith(b"<"):
+                    entry["type"] = "other"
+                    entry["extracted"] = {"summary": "HTML-шаблон, не файл"}
+                    downloaded.append(entry)
+                    continue
+
+            entry["method"] = method
+            entry["text_len"] = len(text or "")
+            doc_type = classify_document(title, url, text or "", entry["ext"])
+            entry["type"] = doc_type
+
+            if doc_type == "photo":
+                entry["extracted"] = {"summary": "есть фото"}
+                lot["has_photos"] = True
+            elif text and len(text) >= 40:
+                got_readable = True
+                parsed = parse_document_content(doc_type, text, title)
+                entry["extracted"] = parsed
+                apply_lot_document(lot, doc_type, text, parsed, title=title, method=method)
+                log.info(
+                    "DOC %s type=%s bytes=%d text=%d method=%s title=%r",
+                    url, doc_type, len(raw), len(text), method, title[:60],
+                )
+            else:
+                entry["extracted"] = {"summary": "скачан, текст не извлечён"}
+                if doc_type == "egrn":
+                    lot["egrn_ocr_failed"] = True
+
+            downloaded.append(entry)
+        except Exception as e:
+            log.warning("DOC err %s: %s", url, e)
+            entry["extracted"] = {"summary": f"ошибка: {e}"}
+            downloaded.append(entry)
+
+    lot["lot_documents"] = downloaded
+    lot["documents_downloaded_count"] = sum(1 for d in downloaded if d.get("download_ok"))
+    lot["pdfs_downloaded"] = [d for d in downloaded if d.get("ext") == "pdf" and d.get("download_ok")]
+    lot["pdfs_downloaded_count"] = len(lot["pdfs_downloaded"])
+
+    if lot.get("has_documents_on_site") and not any(d.get("download_ok") for d in downloaded):
+        lot["pdf_download_failed"] = True
+    elif got_readable and not lot.get("egrn_read_ok") and not lot.get("appraisal_parsed", {}).get("parsed_ok"):
+        if any(d.get("type") == "egrn" and d.get("text_len", 0) < 80 for d in downloaded):
+            lot["egrn_ocr_failed"] = True
+
+
+async def _try_lot_pdfs_legacy(lot, page, ctx):
+    """Fallback если lot_documents недоступен."""
     from analyzer import apply_egrn_to_lot, apply_appraisal_to_lot
     extract_pdf_text = discover_pdf_urls_fn = classify_pdf_type = None
     try:
@@ -434,12 +592,7 @@ async def _try_lot_pdfs(lot, page, ctx):
 
     for pdf_url in urls:
         try:
-            raw = await _fetch_pdf_bytes(page, pdf_url)
-            status = 0
-            if not raw and ctx:
-                resp = await ctx.request.get(pdf_url)
-                status = resp.status
-                raw = await resp.body() if resp.status == 200 else b""
+            raw, status = await _fetch_file_bytes(page, ctx, pdf_url, lot_url)
             if not raw:
                 log.debug("PDF skip %s status=%s", pdf_url, status)
                 continue
