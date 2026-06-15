@@ -482,7 +482,7 @@ def format_price_line(an: dict) -> str:
     if not an.get("market_known"):
         if lot_type == "авто":
             return f"💰 {price} | _оценить рынок авто вручную_"
-        if lot_type == "земля" or an.get("land_manual_market"):
+        if lot_type == "земля":
             return f"💰 {price} | _оценить рынок земли вручную_"
         return f"💰 {price} | _рынок не определён — оценить вручную_"
     disc = an.get("discount_pct", "0")
@@ -958,6 +958,66 @@ risk_level: низкий / средний / высокий / критическ�
     )
 
 
+def minimal_lot_analysis(lot: dict) -> dict:
+    """Минимальная карточка, если полный analyze_lot упал."""
+    lot_type = lot.get("category") or detect_type(
+        f"{lot.get('title', '')} {lot.get('description', '')[:500]}"
+    )
+    lot_price = float(lot.get("price") or 0)
+    title = lot.get("title_full") or lot.get("title", "")
+
+    def fmt(p):
+        try:
+            p = float(p)
+            if p >= 1_000_000:
+                return f"{p / 1_000_000:.1f} млн ₽"
+            if p > 0:
+                return f"{int(p):,} ₽".replace(",", " ")
+        except (TypeError, ValueError):
+            pass
+        return "уточните на сайте"
+
+    an_stub = {
+        "price": fmt(lot_price),
+        "market_price": "не определён",
+        "land_manual_market": lot_type == "земля",
+        "market_known": False,
+        "market_source": "",
+        "discount_pct": "?",
+        "lot_type": lot_type,
+    }
+    trading = build_trading_summary(lot)
+    return {
+        "lot_type": lot_type,
+        "total_score": 6.0,
+        "score_label": "📊 6.0/10",
+        "price": an_stub["price"],
+        "market_price": "не определён",
+        "market_known": False,
+        "market_comment": "",
+        "discount_pct": "?",
+        "discount_ok": False,
+        "qualifies_hot": False,
+        "lot_price_raw": lot_price,
+        "market_price_raw": 0,
+        "price_line": format_price_line(an_stub),
+        "step": "",
+        "legal_text": "",
+        "document_status": resolve_document_status(lot),
+        "auto_summary": "",
+        "trading_summary": trading,
+        "action_emoji": "🟡",
+        "verdict_label": "Смотреть",
+        "verdict_detail": "анализ упрощён — проверьте документы",
+        "action": "ПРОВЕРИТЬ ДОКУМЕНТЫ",
+        "risk_level": "🟡",
+        "risk_score": 50,
+        "invest_score": 50,
+        "red_flags_text": "",
+        "title_hint": title[:70],
+    }
+
+
 async def analyze_lot(lot: dict, light: bool = False) -> dict:
     title     = lot.get("title_full") or lot.get("title", "")
     region    = lot.get("region", "moskva")
@@ -1219,11 +1279,25 @@ async def analyze_lot(lot: dict, light: bool = False) -> dict:
         "lot_price_raw": lot_price,
         "market_price_raw": mkt_prc if market_known else 0,
         "discount_pct": str(disc_pct) if market_known and disc_pct > 0 else "?",
-        "land_manual_market": mkt.get("manual_market", False) or not market_known,
+        "land_manual_market": lot_type == "земля" and mkt.get("manual_market", False),
         "market_known": market_known,
     }
     from verdict import run_verdict_pipeline
-    vr = run_verdict_pipeline(lot, partial_an)
+    try:
+        vr = run_verdict_pipeline(lot, partial_an)
+    except Exception:
+        log.exception("verdict pipeline failed for lot %s", lot.get("id", ""))
+        vr = {
+            "verdict_label": "Смотреть",
+            "verdict_detail": "вердикт не рассчитан",
+            "verdict_card": "",
+            "risk_score": 50,
+            "risk_level": "средний",
+            "invest_score": 50,
+            "facts_json": {},
+            "manual_checks": [],
+            "key_flags": [],
+        }
     verdict_label = vr["verdict_label"]
     action_map_v = {
         "Мимо": "🔴", "Смотреть": "🟡",
