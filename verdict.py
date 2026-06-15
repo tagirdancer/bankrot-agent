@@ -1,72 +1,16 @@
 """
-Структурированный вердикт по лоту — без выдумок.
-Шаг 1: извлечение фактов в JSON (только из источников карточки/ЕГРН).
-Шаг 2–4: скоринг риска и инвест-привлекательности строго по JSON.
+Структурированный вердикт по лоту — только факты из прочитанных документов.
+Без рекомендаций «бери/не бери» и без выдуманной уверенности.
 """
+from __future__ import annotations
+
 import re
-from typing import Optional
+from typing import Any
 
 LEGAL_FOOTER = (
-    "Проверка юриста по конкретному лоту обязательна. "
-    "Это не юридическое заключение."
+    "Это не юридическое заключение и не инвестиционная рекомендация. "
+    "Решение — за вами; юрист по конкретному лоту обязателен."
 )
-
-OBJECT_TYPE_MAP = {
-    "квартира": "квартира",
-    "апартаменты": "квартира",
-    "дом": "иное",
-    "коммерция": "коммерция",
-    "земля": "земля",
-    "авто": "авто",
-    "гараж": "иное",
-    "бизнес": "иное",
-    "прочее": "иное",
-}
-
-LIQUIDITY = {
-    "квартира": 75,
-    "коммерция": 55,
-    "земля": 40,
-    "авто": 60,
-    "иное": 45,
-}
-
-
-def _sources(lot: dict) -> list[tuple[str, str]]:
-    out = []
-    if lot.get("description"):
-        out.append((lot["description"], "карточка tbankrot"))
-    if lot.get("pdf_text"):
-        out.append((lot["pdf_text"], "ЕГРН/PDF"))
-    if lot.get("analytics_text"):
-        out.append((lot["analytics_text"], "аналитика tbankrot"))
-    title = lot.get("title_full") or lot.get("title", "")
-    if title:
-        out.append((title, "заголовок карточки"))
-    return out
-
-
-def _scan(sources: list[tuple[str, str]], patterns: list[str]) -> tuple[bool, str]:
-    for text, src in sources:
-        tl = text.lower()
-        for p in patterns:
-            if p in tl:
-                return True, f"{src}: «{p}»"
-    return False, ""
-
-
-def _yes_no_unknown(
-    sources: list[tuple[str, str]],
-    yes_p: list[str],
-    no_p: list[str],
-) -> tuple[str, str]:
-    found, src = _scan(sources, yes_p)
-    if found:
-        return "да", src
-    found, src = _scan(sources, no_p)
-    if found:
-        return "нет", src
-    return "не указано", ""
 
 
 def _fmt_money(v) -> str:
@@ -81,405 +25,401 @@ def _fmt_money(v) -> str:
     return "не указано"
 
 
-def extract_lot_facts(lot: dict, an: dict) -> dict:
-    """ШАГ 1 — факты только из доступных полей источника."""
-    sources = _sources(lot)
-    src_map: dict[str, str] = {}
+def _encumbrance_status(text: str) -> str:
+    if not text or not str(text).strip():
+        return "не указано"
+    tl = str(text).lower()
+    has_negative = any(x in tl for x in (
+        "ограничен", "ипотек", "залог", "арест", "сервитут", "рента",
+        "статьей 56", "ст. 56",
+    ))
+    has_clean = any(x in tl for x in (
+        "не зарегистрир", "отсутств", "нет (по тексту", "без обремен",
+        "обременени",  # часто «обременения: не зарегистрировано»
+    ))
+    if has_negative and ("ограничен" in tl or "статьей" in tl or "ипотек" in tl or "арест" in tl):
+        return "есть ограничения/обременения"
+    if has_negative:
+        return "есть упоминания — проверить вручную"
+    if has_clean and "не зарегистрир" in tl:
+        return "нет (по тексту ЕГРН)"
+    if has_clean:
+        return "явных обременений в тексте нет"
+    return "не указано"
 
-    lot_type = lot.get("category", "прочее")
-    object_type = OBJECT_TYPE_MAP.get(lot_type, "иное")
-    if object_type != "не указано":
-        src_map["object_type"] = "категория из карточки (detect_type)"
 
-    address = (lot.get("address") or "").strip()
-    egrn = lot.get("egrn_parsed") or {}
-    if not address and egrn.get("address"):
-        address = egrn["address"]
-    if address:
-        src_map["address"] = "карточка tbankrot / Росреестр"
-        address_out = address[:120]
-    else:
-        address_out = "не указано"
+def _egrn_object_label(rec: dict) -> str:
+    title = (rec.get("source_title") or "").strip()
+    if title:
+        if "гараж" in title.lower():
+            return "гараж"
+        if "з.у" in title.lower() or "земл" in title.lower() or "з-у" in title.lower():
+            return "земля"
+        if "здан" in title.lower():
+            return "здание"
+        return title[:50]
+    cad = rec.get("cadastral") or "объект"
+    return f"кад. {cad}"
 
-    price_lot = lot.get("price") or an.get("lot_price_raw")
-    if price_lot:
-        src_map["price_lot"] = "карточка tbankrot"
 
-    if an.get("land_manual_market") or not an.get("market_known", True):
-        price_market = None
-    else:
-        price_market = an.get("market_price_raw") or None
-        if price_market:
-            src_map["price_market_estimate"] = "ориентир calc_market_price (площадь × таблица)"
+def _documents_coverage(lot: dict) -> dict[str, str]:
+    """Статус каждого типа документов: получен/распознан/не получен."""
+    docs = lot.get("lot_documents") or []
+    by_type: dict[str, list] = {}
+    for d in docs:
+        by_type.setdefault(d.get("type") or "other", []).append(d)
 
-    disc_raw = an.get("discount_pct", "?")
-    try:
-        discount_pct = (
-            int(disc_raw)
-            if disc_raw and str(disc_raw) not in ("0", "?", "")
-            else None
-        )
-    except (TypeError, ValueError):
-        discount_pct = None
-    if discount_pct is not None:
-        src_map["discount_pct"] = "расчёт по price_lot и price_market_estimate"
+    def _status(doc_type: str) -> str:
+        items = by_type.get(doc_type) or []
+        if doc_type == "photo":
+            if any(x.get("download_ok") for x in items):
+                return "есть"
+            return "не получен"
+        if not items:
+            if doc_type == "egrn" and (lot.get("egrn_records") or lot.get("egrn_read_ok")):
+                return "распознан"
+            return "не получен"
+        ok = [x for x in items if x.get("download_ok")]
+        parsed = [x for x in ok if (x.get("text_len") or 0) >= 40 or (x.get("extracted") or {}).get("parsed_ok")]
+        if parsed:
+            return "распознан"
+        if ok:
+            return "скачан, текст не извлечён"
+        return "не скачан"
 
-    fmt = lot.get("auction_format", "")
-    if fmt == "публичное предложение":
-        auction_type = "публичное предложение"
-        src_map["auction_type"] = "карточка tbankrot"
-    elif fmt == "аукцион":
-        auction_type = "открытые торги"
-        src_map["auction_type"] = "карточка tbankrot"
-    else:
-        auction_type = "не указано"
-
-    deposit = lot.get("deposit") or None
-    if deposit:
-        src_map["deposit"] = "карточка tbankrot"
-
-    dl_parts = []
-    if lot.get("application_deadline"):
-        dl_parts.append(f"заявки до {lot['application_deadline']}")
-        src_map["deadlines"] = "карточка tbankrot"
-    sc, st = lot.get("step_current", 0), lot.get("step_total", 0)
-    if sc and st:
-        dl_parts.append(f"шаг {sc}/{st}")
-        src_map.setdefault("deadlines", "карточка tbankrot")
-    if lot.get("next_reduction_date") and lot.get("next_reduction_price"):
-        np = lot["next_reduction_price"]
-        p = f"{np / 1e6:.1f} млн ₽" if np >= 1_000_000 else f"{int(np):,} ₽".replace(",", " ")
-        dl_parts.append(f"след. снижение {lot['next_reduction_date']} → {p}")
-        src_map.setdefault("deadlines", "карточка tbankrot")
-    deadlines = " | ".join(dl_parts) if dl_parts else "не указано"
-
-    pdf = lot.get("pdf_text", "")
-    if pdf:
-        tl = pdf.lower()
-        if any(x in tl for x in ("нет обремен", "обременен не зарегистрир", "без обремен", "обременения отсутств")):
-            egrn_clean = "да"
-            src_map["egrn_clean"] = "ЕГРН/PDF"
-        elif any(x in tl for x in ("обременен", "залог", "арест", "ипотек")):
-            egrn_clean = "нет"
-            src_map["egrn_clean"] = "ЕГРН/PDF"
-        else:
-            egrn_clean = "не указано"
-    else:
-        egrn_clean = "не указано"
-
-    enc_found, enc_src = _scan(sources, ["обременен", "залог", "арест", "ипотек"])
-    if enc_found:
-        encumbrances = "упоминание в тексте"
-        src_map["encumbrances"] = enc_src
-    else:
-        encumbrances = "не указано"
-
-    registered_persons, reg_src = _yes_no_unknown(
-        sources,
-        ["прописан", "зарегистрирован", "зарегистрировано"],
-        ["не прописан", "прописанных нет", "лиц не зарегистрир", "отсутствуют зарегистрир"],
-    )
-    if reg_src:
-        src_map["registered_persons"] = reg_src
-
-    minors_registered, min_src = _yes_no_unknown(
-        sources,
-        ["несовершеннолетн"],
-        ["несовершеннолетн не зарегистрир", "без несовершеннолетн"],
-    )
-    if min_src:
-        src_map["minors_registered"] = min_src
-
-    sole_housing, sole_src = _yes_no_unknown(
-        sources,
-        ["единственн"],
-        ["не является единствен", "не единственн"],
-    )
-    if sole_src:
-        src_map["sole_housing"] = sole_src
-    if sole_housing == "да" and not any(
-        x in " ".join(t for t, _ in sources).lower()
-        for x in ("жил", "жиль", "квартир", "дом")
-    ):
-        sole_housing = "не указано"
-        src_map.pop("sole_housing", None)
-
-    disputes, disp_src = _yes_no_unknown(
-        sources,
-        ["kad.arbitr", "картотек", "оспариван", "обжалован"],
-        [],
-    )
-    active_disputes = disputes if disputes != "не указано" else "не указано"
-    if disp_src:
-        src_map["active_disputes_kadarbitr"] = disp_src
-
-    direct_sale, direct_src = _scan(
-        sources, ["у должника", "напрямую у", "без торгов", "вне торгов"]
-    )
-    rent_rights, rent_src = _scan(
-        sources, ["аренд", "найм", "субаренд"]
-    )
-
-    disc_explained, _ = _scan(
-        sources,
-        ["согласован", "неустроен", "аварийн", "ремонт", "самовольн", "техническ"],
-    )
-
-    facts = {
-        "lot_url": lot.get("url", ""),
-        "object_type": object_type,
-        "address": address_out,
-        "price_lot": price_lot if price_lot else None,
-        "price_market_estimate": price_market,
-        "discount_pct": discount_pct,
-        "auction_type": auction_type,
-        "deposit": deposit,
-        "deadlines": deadlines,
-        "egrn_clean": egrn_clean,
-        "encumbrances": encumbrances,
-        "registered_persons": registered_persons,
-        "minors_registered": minors_registered,
-        "sole_housing": sole_housing,
-        "active_disputes_kadarbitr": active_disputes,
-        "source_per_field": src_map,
-        "_direct_sale": direct_sale,
-        "_rent_rights": rent_rights,
-        "_extreme_discount_unexplained": (
-            discount_pct is not None and discount_pct >= 50 and not disc_explained
-        ),
-        "_has_pdf": bool(pdf and len(pdf) > 100),
-        "_is_housing": object_type == "квартира" or lot_type in ("квартира", "апартаменты", "дом"),
-        "_participants": lot.get("participants", 0),
-        "_public_offer_reduction": bool(lot.get("next_reduction_date")),
+    return {
+        "egrn": _status("egrn"),
+        "appraisal": _status("appraisal"),
+        "contract": _status("contract"),
+        "application": _status("application"),
+        "info_message": _status("info_message"),
+        "photo": _status("photo"),
     }
-    return facts
+
+
+def extract_document_facts(lot: dict, an: dict) -> dict[str, Any]:
+    """Факты строго из прочитанных документов и полей парсера."""
+    egrn_records = list(lot.get("egrn_records") or [])
+    egrn_parsed = lot.get("egrn_parsed") or {}
+    if not egrn_records and egrn_parsed.get("objects"):
+        egrn_records = list(egrn_parsed["objects"])
+
+    egrn_objects: list[dict] = []
+    for rec in egrn_records:
+        enc_st = _encumbrance_status(rec.get("encumbrances", ""))
+        egrn_objects.append({
+            "label": _egrn_object_label(rec),
+            "cadastral": rec.get("cadastral") or "не указано",
+            "owner": rec.get("owner") or "не указано",
+            "area": rec.get("area") or "не указано",
+            "encumbrances": enc_st,
+            "encumbrances_raw": (rec.get("encumbrances") or "")[:160],
+            "arrests": rec.get("arrests") or "не указано",
+            "parsed_ok": bool(rec.get("parsed_ok")),
+            "source": rec.get("source_title") or "ЕГРН",
+        })
+
+    coverage = _documents_coverage(lot)
+    has_any_egrn = bool(egrn_objects) or coverage["egrn"] in ("распознан", "скачан, текст не извлечён")
+
+    # Сводка по обременениям
+    enc_issues = [o for o in egrn_objects if "есть" in o["encumbrances"]]
+    enc_clean = [o for o in egrn_objects if o["encumbrances"].startswith("нет")]
+
+    appr = lot.get("appraisal_parsed") or {}
+    market_known = bool(an.get("market_known"))
+    market_source = an.get("market_source") or ""
+    if appr.get("parsed_ok"):
+        market_line = appr.get("summary") or "ориентир из отчёта об оценке"
+        market_status = "определена из отчёта"
+    elif coverage["appraisal"] == "скачан, текст не извлечён":
+        market_line = "отчёт скачан, текст не распознан (вероятно скан)"
+        market_status = "не определена"
+    elif coverage["appraisal"] == "распознан":
+        market_line = appr.get("summary") or "данные отчёта частично извлечены"
+        market_status = "частично"
+    elif market_known and market_source == "appraisal":
+        market_line = an.get("market_comment") or "из отчёта"
+        market_status = "из отчёта (карточка)"
+    elif market_known:
+        market_line = f"ориентир {an.get('market_price', '—')} ({market_source or 'расчёт'})"
+        market_status = "ориентир без отчёта"
+    else:
+        market_line = "не определена — отчёт не распознан или не получен"
+        market_status = "не определена"
+
+    contract = lot.get("contract_parsed") or {}
+    application = lot.get("application_parsed") or {}
+    info_msg = lot.get("info_message_parsed") or {}
+
+    doc_types_found = []
+    for d in lot.get("lot_documents") or []:
+        if d.get("download_ok"):
+            doc_types_found.append(d.get("type") or "other")
+    doc_types_found = list(dict.fromkeys(doc_types_found))
+
+    return {
+        "egrn_count": len(egrn_objects),
+        "egrn_objects": egrn_objects,
+        "egrn_has_data": has_any_egrn,
+        "egrn_encumbrance_issues": enc_issues,
+        "egrn_encumbrance_clean": enc_clean,
+        "coverage": coverage,
+        "market_status": market_status,
+        "market_line": market_line,
+        "appraisal_flags": appr.get("restriction_flags") or lot.get("appraisal_flags") or [],
+        "appraisal_court": appr.get("court_cases") or "не указано",
+        "contract_summary": contract.get("summary") if contract.get("parsed_ok") else "",
+        "application_summary": application.get("summary") if application.get("parsed_ok") else "",
+        "info_message_summary": info_msg.get("summary") if info_msg.get("parsed_ok") else "",
+        "documents_downloaded": lot.get("documents_downloaded_count") or 0,
+        "doc_types_found": doc_types_found,
+        "price_lot": lot.get("price") or an.get("lot_price_raw"),
+        "discount_pct": an.get("discount_pct"),
+        "document_status": an.get("document_status") or "",
+    }
+
+
+def build_verdict_sections(facts: dict) -> dict[str, Any]:
+    """Плюсы, минусы, ручные проверки, уровень риска — только из facts."""
+    pluses: list[str] = []
+    minuses: list[str] = []
+    manual: list[str] = []
+    known_lines: list[str] = []
+    unknown_lines: list[str] = []
+
+    cov = facts["coverage"]
+
+    # --- Известное из документов ---
+    if facts["egrn_count"]:
+        known_lines.append(f"ЕГРН: {facts['egrn_count']} выписк(и/а) распознана(ы)")
+        for obj in facts["egrn_objects"]:
+            line = (
+                f"  • {obj['label']}: кад. {obj['cadastral']}, "
+                f"обременения — {obj['encumbrances']}"
+            )
+            if obj["owner"] != "не указано":
+                line += f", собственник: {obj['owner'][:70]}"
+            known_lines.append(line)
+    elif cov["egrn"] == "скачан, текст не извлечён":
+        unknown_lines.append("ЕГРН: файл скачан, текст не извлечён")
+    elif cov["egrn"] == "не получен":
+        unknown_lines.append("ЕГРН: не получена")
+
+    if facts["market_status"] == "определена из отчёта":
+        known_lines.append(f"Рыночная оценка: {facts['market_line']}")
+    else:
+        unknown_lines.append(f"Рыночная цена: {facts['market_line']}")
+
+    if cov["contract"] == "распознан" and facts["contract_summary"]:
+        known_lines.append(f"Договор: {facts['contract_summary'][:120]}")
+    elif cov["contract"] == "скачан, текст не извлечён":
+        unknown_lines.append("Договор: скачан, текст не извлечён")
+    if cov["application"] == "распознан" and facts["application_summary"]:
+        known_lines.append(f"Заявка: {facts['application_summary'][:100]}")
+    elif cov["application"] == "распознан":
+        unknown_lines.append("Заявка: шаблон без заполненных полей")
+    if cov["info_message"] == "распознан" and facts["info_message_summary"]:
+        known_lines.append(f"Инф.сообщение: {facts['info_message_summary'][:100]}")
+    elif cov["info_message"] == "скачан, текст не извлечён":
+        unknown_lines.append("Инф.сообщение: скачан, текст не извлечён")
+    if cov["photo"] == "есть":
+        known_lines.append("Фото объекта: есть на сайте")
+
+    # --- Плюсы ---
+    for obj in facts["egrn_encumbrance_clean"]:
+        pluses.append(
+            f"ЕГРН ({obj['label']}): обременений по тексту выписки нет"
+        )
+    if facts["egrn_count"] >= 2:
+        pluses.append(f"Полный комплект выписок: {facts['egrn_count']} объекта в документах")
+    if facts["market_status"] == "определена из отчёта":
+        pluses.append("Есть ориентир рыночной стоимости из отчёта об оценке")
+    if facts["contract_summary"]:
+        pluses.append("Проект договора прочитан — виден предмет сделки")
+    if cov["photo"] == "есть":
+        pluses.append("Есть фото объекта")
+
+    # --- Минусы / внимание ---
+    for obj in facts["egrn_encumbrance_issues"]:
+        minuses.append(
+            f"ЕГРН ({obj['label']}): {obj['encumbrances']}"
+            + (f" — {obj['encumbrances_raw'][:80]}" if obj.get("encumbrances_raw") else "")
+        )
+    for obj in facts["egrn_objects"]:
+        if obj["arrests"] and obj["arrests"] != "не указано":
+            minuses.append(f"ЕГРН ({obj['label']}): аресты — {obj['arrests'][:80]}")
+    for flag in facts["appraisal_flags"]:
+        minuses.append(f"Отчёт об оценке: зона/ограничение — {flag}")
+    if facts["appraisal_court"] not in ("не указано", "не обнаружены", ""):
+        if "обнаруж" in str(facts["appraisal_court"]).lower():
+            minuses.append(f"Отчёт об оценке: судебные дела — {facts['appraisal_court']}")
+    if not facts["egrn_has_data"]:
+        minuses.append("Нет распознанной выписки ЕГРН — юр. статус не проверен")
+    if cov["appraisal"] == "скачан, текст не извлечён":
+        minuses.append("Отчёт об оценке не распознан — рыночный ориентир недоступен")
+
+    # --- Ручные проверки ---
+    if not facts["egrn_has_data"]:
+        manual.append("Актуальная выписка ЕГРН на каждый объект (здание, земля, гараж)")
+    elif facts["egrn_encumbrance_issues"]:
+        manual.append("Расшифровка обременений/ограничений с юристом по каждой выписке")
+    if cov["appraisal"] != "распознан":
+        manual.append("Отчёт об оценке — прочитать вручную или заказать OCR")
+    if cov["info_message"] == "скачан, текст не извлечён":
+        manual.append("Информационное сообщение — условия торгов и сроки")
+    manual.append("Прописанные лица, единственное жильё, споры на kad.arbitr.ru")
+    if facts["egrn_count"]:
+        manual.append("Соответствие кадастровых номеров в договоре и выписках")
+
+    manual = list(dict.fromkeys(m for m in manual if m))
+
+    # --- Уровень риска по документам ---
+    risk_score = 0
+    risk_reasons: list[str] = []
+
+    if not facts["egrn_has_data"]:
+        risk_score += 3
+        risk_reasons.append("нет проверенной выписки ЕГРН")
+    if facts["egrn_encumbrance_issues"]:
+        risk_score += 2 * len(facts["egrn_encumbrance_issues"])
+        risk_reasons.append("обременения/ограничения в выписках")
+    if any("арест" in (o.get("arrests") or "").lower() for o in facts["egrn_objects"]):
+        risk_score += 2
+        risk_reasons.append("упоминание арестов")
+    if cov["appraisal"] == "скачан, текст не извлечён":
+        risk_score += 1
+        risk_reasons.append("отчёт об оценке не распознан")
+    if facts["appraisal_flags"]:
+        risk_score += 1
+        risk_reasons.append("зоны ограничений в отчёте")
+
+    if risk_score >= 4:
+        risk_level = "высокий"
+    elif risk_score >= 2:
+        risk_level = "средний"
+    elif facts["egrn_has_data"] and not facts["egrn_encumbrance_issues"]:
+        risk_level = "низкий"
+    elif not facts["egrn_has_data"]:
+        risk_level = "высокий"
+    else:
+        risk_level = "средний"
+
+    if not risk_reasons:
+        if risk_level == "низкий":
+            risk_reasons.append("выписки прочитаны, критичных обременений в тексте не найдено")
+        else:
+            risk_reasons.append("данных недостаточно для уверенной оценки")
+
+    return {
+        "known_lines": known_lines,
+        "unknown_lines": unknown_lines,
+        "pluses": pluses[:6],
+        "minuses": minuses[:8],
+        "manual_checks": manual[:6],
+        "document_risk_level": risk_level,
+        "document_risk_reasons": risk_reasons[:4],
+    }
+
+
+def format_verdict_card(facts: dict, sections: dict) -> str:
+    lines = ["*Вердикт по документам*", ""]
+
+    if sections["known_lines"]:
+        lines.append("*Что известно из документов:*")
+        lines.extend(sections["known_lines"])
+        lines.append("")
+
+    if sections["unknown_lines"]:
+        lines.append("*Что не определено:*")
+        for u in sections["unknown_lines"]:
+            lines.append(f"• {u}")
+        lines.append("")
+
+    if sections["pluses"]:
+        lines.append("*В плюс (по фактам):*")
+        for p in sections["pluses"]:
+            lines.append(f"• {p}")
+        lines.append("")
+
+    if sections["minuses"]:
+        lines.append("*Минусы / на что обратить внимание:*")
+        for m in sections["minuses"]:
+            lines.append(f"• {m}")
+        lines.append("")
+
+    if sections["manual_checks"]:
+        lines.append("*Проверить вручную (сверх документов):*")
+        for c in sections["manual_checks"]:
+            lines.append(f"• {c}")
+        lines.append("")
+
+    rl = sections["document_risk_level"]
+    rr = "; ".join(sections["document_risk_reasons"])
+    lines.append(f"*Риск по документам:* {rl} — {rr}")
+
+    price_s = _fmt_money(facts.get("price_lot"))
+    disc = facts.get("discount_pct")
+    disc_s = f"{disc}%" if disc and str(disc) not in ("?", "0", "") else "не указано"
+    lines.append(f"*Цена лота:* {price_s} | *Дисконт:* {disc_s}")
+
+    lines.append("")
+    lines.append(f"_{LEGAL_FOOTER}_")
+    return "\n".join(lines)
+
+
+def run_verdict_pipeline(lot: dict, an: dict) -> dict:
+    """Полный пайплайн вердикта по документам."""
+    facts = extract_document_facts(lot, an)
+    sections = build_verdict_sections(facts)
+    card = format_verdict_card(facts, sections)
+
+    rl = sections["document_risk_level"]
+    headline = f"Риск по документам: {rl}"
+    detail = "; ".join(sections["document_risk_reasons"][:2]) or "см. карточку"
+
+    risk_emoji = {"низкий": "🟢", "средний": "🟡", "высокий": "🔴"}.get(rl, "🟡")
+
+    return {
+        "facts_json": facts,
+        "document_risk_level": rl,
+        "document_risk_reasons": sections["document_risk_reasons"],
+        "verdict_pluses": sections["pluses"],
+        "verdict_minuses": sections["minuses"],
+        "manual_checks": sections["manual_checks"],
+        "known_lines": sections["known_lines"],
+        "unknown_lines": sections["unknown_lines"],
+        "risk_score": {"низкий": 25, "средний": 55, "высокий": 85}.get(rl, 55),
+        "risk_level": risk_emoji,
+        "invest_score": None,
+        "verdict_label": headline,
+        "verdict_detail": detail,
+        "verdict_card": card,
+        "key_flags": sections["minuses"][:3],
+    }
+
+
+# --- совместимость со старыми вызовами ---
+def extract_lot_facts(lot: dict, an: dict) -> dict:
+    return extract_document_facts(lot, an)
 
 
 def score_cancellation_risk(facts: dict) -> dict:
-    """ШАГ 2 — риск отмены сделки, старт 100."""
-    score = 100
-    red_factors: list[str] = []
-    yellow_factors: list[str] = []
-    manual_checks: list[str] = []
-
-    if facts["registered_persons"] == "да":
-        score -= 45
-        red_factors.append("прописанные/зарегистрированные лица")
-
-    if facts["minors_registered"] == "да":
-        score -= 45
-        red_factors.append("несовершеннолетние зарегистрированы")
-
-    if facts["sole_housing"] == "да":
-        score -= 45
-        red_factors.append("единственное жильё должника")
-
-    if facts.get("_direct_sale"):
-        score -= 45
-        red_factors.append("покупка не с открытых торгов")
-
-    if facts["active_disputes_kadarbitr"] == "да":
-        score -= 45
-        red_factors.append("активный спор / оспаривание")
-
-    if facts.get("_extreme_discount_unexplained"):
-        score -= 40
-        red_factors.append("экстремальный дисконт без объяснения в карточке")
-
-    if facts["encumbrances"] != "не указано" or facts["egrn_clean"] == "нет":
-        score -= 20
-        yellow_factors.append("обременения / аресты в тексте")
-
-    if facts.get("_rent_rights"):
-        score -= 18
-        yellow_factors.append("аренда / права третьих лиц")
-
-    if facts["egrn_clean"] == "не указано" and facts["encumbrances"] == "не указано":
-        score -= 20
-        yellow_factors.append("нет данных по обременениям")
-        manual_checks.append("выписка ЕГРН — обременения и аресты")
-
-    if facts["_is_housing"]:
-        if facts["registered_persons"] == "не указано":
-            score -= 22
-            yellow_factors.append("нет данных по прописанным")
-            manual_checks.append("прописанные и зарегистрированные лица")
-        if facts["minors_registered"] == "не указано" and facts["registered_persons"] != "нет":
-            manual_checks.append("наличие несовершеннолетних")
-        if facts["sole_housing"] == "не указано":
-            manual_checks.append("статус единственного жилья должника")
-
-    if facts["active_disputes_kadarbitr"] == "не указано":
-        manual_checks.append("споры по лоту на kad.arbitr.ru")
-
-    score = max(0, min(100, score))
-
-    if red_factors:
-        level = "🔴"
-        score = min(score, 44)
-    elif score >= 75:
-        level = "🟢"
-    elif score >= 45:
-        level = "🟡"
-    else:
-        level = "🔴"
-
-    if red_factors:
-        level = "🔴"
-    elif facts["_is_housing"] and (
-        facts["registered_persons"] == "не указано"
-        or facts["egrn_clean"] == "не указано"
-    ):
-        if level == "🟢":
-            level = "🟡"
-        score = min(score, 74)
-
-    key_flags = (red_factors + yellow_factors)[:3]
-
+    sections = build_verdict_sections(facts)
+    rl = sections["document_risk_level"]
     return {
-        "score": score,
-        "level": level,
-        "red_factors": red_factors,
-        "yellow_factors": yellow_factors,
-        "key_flags": key_flags,
-        "manual_checks": list(dict.fromkeys(manual_checks)),
+        "score": {"низкий": 75, "средний": 50, "высокий": 25}.get(rl, 50),
+        "level": {"низкий": "🟢", "средний": "🟡", "высокий": "🔴"}.get(rl, "🟡"),
+        "red_factors": sections["minuses"][:3],
+        "yellow_factors": sections["unknown_lines"][:2],
+        "key_flags": sections["minuses"][:3],
+        "manual_checks": sections["manual_checks"],
     }
 
 
 def score_investment_attractiveness(facts: dict, lot: dict) -> dict:
-    """ШАГ 3 — инвест-привлекательность 0–100, только по JSON-фактам."""
-    score = 40
-    notes: list[str] = []
-
-    obj = facts["object_type"]
-    score += LIQUIDITY.get(obj, 45) * 0.25
-    notes.append(f"ликвидность типа «{obj}»")
-
-    disc = facts.get("discount_pct")
-    if disc is not None and disc > 0:
-        if disc >= 50:
-            score += 5
-            notes.append(f"дисконт {disc}% (экстремальный — учтён в риске)")
-        elif disc >= 30:
-            score += 18
-            notes.append(f"дисконт {disc}%")
-        elif disc >= 15:
-            score += 12
-            notes.append(f"дисконт {disc}%")
-        else:
-            score += 6
-            notes.append(f"дисконт {disc}%")
-    elif facts.get("price_market_estimate") is None and obj == "земля":
-        notes.append("рыночная оценка земли не рассчитана — вручную")
-    else:
-        notes.append("дисконт не подтверждён данными")
-
-    if facts["auction_type"] == "публичное предложение":
-        score += 8
-        notes.append("публичное предложение")
-        if facts.get("_public_offer_reduction"):
-            score += 10
-            notes.append("есть график снижения — точка входа")
-
-    region = lot.get("region", "")
-    if region in ("moskva", "moskovskaya-oblast", "sankt-peterburg"):
-        score += 8
-        notes.append("крупный регион (спрос выше среднего)")
-    elif region:
-        score += 3
-
-    parts = facts.get("_participants", 0)
-    if parts == 0:
-        score += 6
-        notes.append("нет заявок")
-    elif parts > 5:
-        score -= 8
-        notes.append(f"высокая конкуренция ({parts} заявок)")
-
-    score = max(0, min(100, int(round(score))))
-    return {"score": score, "notes": notes}
+    return {"score": 0, "notes": ["не рассчитывается — вердикт только по документам"]}
 
 
 def decide_final_verdict(risk: dict, invest: dict) -> dict:
-    """ШАГ 4 — итоговая логика."""
-    r_level = risk["level"]
-    i_score = invest["score"]
-    high_invest = i_score >= 60
-    manual = risk["manual_checks"]
-
-    if r_level == "🔴":
-        label = "Мимо"
-        detail = "высокий риск отмены или оспаривания"
-    elif r_level == "🟡" and high_invest:
-        label = "Смотреть"
-        missing = ", ".join(manual[:3]) if manual else "ключевые юридические данные"
-        detail = f"нужна проверка: {missing}"
-    elif r_level == "🟢" and high_invest:
-        label = "Брать на due diligence"
-        detail = "риск низкий при подтверждении данных"
-    elif r_level == "🟢":
-        label = "Чисто, но неинтересно по цене"
-        detail = "риск низкий, привлекательность ниже порога"
-    else:
-        label = "Смотреть"
-        missing = ", ".join(manual[:3]) if manual else "юридические данные"
-        detail = f"нужна проверка: {missing}"
-
-    return {"label": label, "detail": detail}
-
-
-def format_verdict_card(facts: dict, risk: dict, invest: dict, verdict: dict) -> str:
-    """Карточка вердикта для Telegram."""
-    obj_line = facts["object_type"]
-    if facts["address"] != "не указано":
-        obj_line += f", {facts['address'][:80]}"
-
-    price_s = _fmt_money(facts.get("price_lot"))
-    mkt_s = _fmt_money(facts.get("price_market_estimate"))
-    disc_s = (
-        f"{facts['discount_pct']}%"
-        if facts.get("discount_pct") is not None
-        else "не указано"
-    )
-
-    dep_s = _fmt_money(facts.get("deposit")) if facts.get("deposit") else "не указано"
-
-    manual_line = ""
-    if risk["manual_checks"]:
-        manual_line = (
-            f"\nЧто проверить вручную: {', '.join(risk['manual_checks'][:4])}"
-        )
-
-    flags_line = ", ".join(risk["key_flags"]) if risk["key_flags"] else "не выявлено в тексте"
-
-    return (
-        f"*Объект:* {obj_line}\n"
-        f"*Цена лота:* {price_s} | *Рыночная оценка:* {mkt_s} | *Дисконт:* {disc_s}\n"
-        f"*Стадия:* {facts['auction_type']} | *Задаток:* {dep_s} | *Сроки:* {facts['deadlines']}\n"
-        f"*Риск отмены:* {risk['level']} ({risk['score']}/100)\n"
-        f"*Инвест-привлекательность:* {invest['score']}/100\n"
-        f"*Ключевые флаги:* {flags_line}\n"
-        f"*Итог:* {verdict['label']} — {verdict['detail']}"
-        f"{manual_line}\n\n"
-        f"_{LEGAL_FOOTER}_"
-    )
-
-
-def run_verdict_pipeline(lot: dict, an: dict) -> dict:
-    """Полный пайплайн: факты → риск → инвест → карточка."""
-    facts = extract_lot_facts(lot, an)
-    risk = score_cancellation_risk(facts)
-    invest = score_investment_attractiveness(facts, lot)
-    verdict = decide_final_verdict(risk, invest)
-    card = format_verdict_card(facts, risk, invest, verdict)
-    return {
-        "facts_json": facts,
-        "risk_score": risk["score"],
-        "risk_level": risk["level"],
-        "invest_score": invest["score"],
-        "verdict_label": verdict["label"],
-        "verdict_detail": verdict["detail"],
-        "verdict_card": card,
-        "manual_checks": risk["manual_checks"],
-        "key_flags": risk["key_flags"],
-    }
+    return {"label": "см. verdict_label", "detail": ""}
