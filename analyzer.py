@@ -354,7 +354,23 @@ def parse_egrn_pdf(text: str) -> dict:
 
 
 def format_egrn_legal_block(egrn: dict) -> str:
-    """Читаемый блок юридических данных из ЕГРН."""
+    """Читаемый блок юридических данных из ЕГРН (один объект или несколько)."""
+    if not egrn:
+        return ""
+    objects = egrn.get("objects") or []
+    if objects:
+        lines = []
+        for i, obj in enumerate(objects, 1):
+            block = _format_single_egrn_block(obj)
+            if block:
+                title = obj.get("source_title") or f"Объект {i}"
+                lines.append(f"【{title}】")
+                lines.append(block)
+        return "\n".join(lines)
+    return _format_single_egrn_block(egrn)
+
+
+def _format_single_egrn_block(egrn: dict) -> str:
     if not egrn:
         return ""
     lines = []
@@ -391,16 +407,58 @@ def apply_appraisal_to_lot(lot: dict, pdf_text: str) -> None:
         lot["appraisal_flags"] = parsed["restriction_flags"]
 
 
-def apply_egrn_to_lot(lot: dict, pdf_text: str, from_real_pdf: bool) -> None:
-    """Парсит ЕГРН и дополняет lot."""
-    lot["pdf_from_egrn"] = from_real_pdf
-    if from_real_pdf:
+def _merge_egrn_records(records: list[dict]) -> dict:
+    """Сводка по нескольким выпискам ЕГРН."""
+    merged = {
+        "objects": records,
+        "cadastral": "", "address": "", "area": "",
+        "owner": "", "encumbrances": "", "share": "", "arrests": "",
+        "summary": "", "parsed_ok": False,
+    }
+    summaries = []
+    for rec in records:
+        if rec.get("parsed_ok"):
+            merged["parsed_ok"] = True
+        if rec.get("summary"):
+            summaries.append(rec["summary"])
+        if not merged["cadastral"] and rec.get("cadastral"):
+            merged["cadastral"] = rec["cadastral"]
+        if not merged["address"] and rec.get("address"):
+            merged["address"] = rec["address"]
+        if not merged["area"] and rec.get("area"):
+            merged["area"] = rec["area"]
+        if not merged["owner"] and rec.get("owner"):
+            merged["owner"] = rec["owner"]
+        if not merged["encumbrances"] and rec.get("encumbrances"):
+            merged["encumbrances"] = rec["encumbrances"]
+    merged["summary"] = " || ".join(summaries)
+    return merged
+
+
+def apply_egrn_to_lot(
+    lot: dict, pdf_text: str, from_real_pdf: bool,
+    source_title: str = "", method: str = "",
+) -> None:
+    """Парсит выписку ЕГРН и добавляет к списку объектов лота."""
+    lot["pdf_from_egrn"] = lot.get("pdf_from_egrn") or from_real_pdf
+    if from_real_pdf and pdf_text:
         lot["egrn_pdf_text"] = pdf_text
         lot["pdf_text"] = pdf_text
     egrn = parse_egrn_pdf(pdf_text) if from_real_pdf and pdf_text else {}
-    lot["egrn_parsed"] = egrn
+    if source_title:
+        egrn["source_title"] = source_title
+    if method:
+        egrn["extract_method"] = method
+
+    records = list(lot.get("egrn_records") or [])
+    records.append(egrn)
+    lot["egrn_records"] = records
+    lot["egrn_parsed"] = _merge_egrn_records(records)
+
     if from_real_pdf and egrn.get("parsed_ok"):
         lot["egrn_read_ok"] = True
+    if method:
+        lot["egrn_extract_method"] = method
     if egrn.get("cadastral") and not lot.get("cadastral"):
         lot["cadastral"] = egrn["cadastral"]
     if egrn.get("address") and not lot.get("address"):
@@ -412,32 +470,66 @@ def apply_egrn_to_lot(lot: dict, pdf_text: str, from_real_pdf: bool) -> None:
             pass
 
 
+def apply_lot_document(
+    lot: dict, doc_type: str, text: str, parsed: dict,
+    title: str = "", method: str = "",
+) -> None:
+    """Применяет результат разбора одного документа к лоту."""
+    if doc_type == "egrn":
+        apply_egrn_to_lot(lot, text, True, source_title=title, method=method)
+    elif doc_type == "appraisal":
+        apply_appraisal_to_lot(lot, text)
+        if method:
+            lot["appraisal_extract_method"] = method
+    elif doc_type == "contract":
+        lot["contract_parsed"] = parsed
+    elif doc_type == "application":
+        lot["application_parsed"] = parsed
+    elif doc_type == "info_message":
+        lot["info_message_parsed"] = parsed
+
+
 def resolve_document_status(lot: dict) -> str:
     """Единый статус документов — без выдумок."""
     egrn = lot.get("egrn_parsed") or {}
     appr = lot.get("appraisal_parsed") or {}
+    docs = lot.get("lot_documents") or lot.get("pdfs_downloaded") or []
+    n_total = lot.get("documents_downloaded_count") or len([d for d in docs if d.get("download_ok")])
+    n_egrn = len(lot.get("egrn_records") or egrn.get("objects") or [])
     parts = []
+
     if lot.get("egrn_read_ok") or (lot.get("pdf_from_egrn") and egrn.get("parsed_ok")):
         suffix = " (OCR)" if lot.get("egrn_extract_method") == "ocr" else ""
-        parts.append(f"ЕГРН{suffix}")
+        if n_egrn > 1:
+            parts.append(f"ЕГРН ×{n_egrn}{suffix}")
+        else:
+            parts.append(f"ЕГРН{suffix}")
     elif lot.get("egrn_ocr_failed"):
         parts.append("ЕГРН не распознан")
     if lot.get("appraisal_read_ok") or appr.get("parsed_ok"):
         parts.append("отчёт об оценке")
-    n = lot.get("pdfs_downloaded_count") or len(lot.get("pdfs_downloaded") or [])
+    if lot.get("contract_parsed", {}).get("parsed_ok"):
+        parts.append("договор")
+    if lot.get("application_parsed", {}).get("parsed_ok"):
+        parts.append("заявка")
+    if lot.get("info_message_parsed", {}).get("parsed_ok"):
+        parts.append("инф.сообщение")
+    if lot.get("has_photos"):
+        parts.append("фото")
+
     if parts:
         base = "Документы: " + ", ".join(parts)
-        if n > len(parts):
-            base += f" (+{n - len(parts)} PDF)"
+        if n_total > len(parts):
+            base += f" (всего файлов: {n_total})"
         return base
     if lot.get("pdf_download_failed"):
-        if lot.get("has_egrn_on_site"):
-            return "выписка на сайте — не удалось скачать (нужна авторизация)"
+        if lot.get("has_documents_on_site") or lot.get("has_egrn_on_site"):
+            return "документы на сайте — не удалось скачать"
         return "документы не получены"
-    if lot.get("has_egrn_on_site"):
-        return "выписка на сайте — текст не извлечён"
-    if n:
-        return f"скачано PDF: {n}, ключевые поля не распознаны"
+    if lot.get("has_documents_on_site") or lot.get("has_egrn_on_site"):
+        return "документы на сайте — текст не извлечён"
+    if n_total:
+        return f"скачано файлов: {n_total}, ключевые поля не распознаны"
     return "Документы не получены"
 
 
