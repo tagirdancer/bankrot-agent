@@ -295,10 +295,10 @@ def extract_lot_id(text: str):
 
 
 async def fetch_and_analyze_lot(lot_id: str):
-    """Парсит и анализирует лот той же логикой, что дайджест (agent.enrich + analyze_lot)."""
+    """Парсит и анализирует лот. EGRN/рынок/Groq не должны ронять карточку."""
     from playwright.async_api import async_playwright
-    from agent import enrich
-    from analyzer import analyze_lot
+    from agent import enrich, login, launch_browser
+    from analyzer import analyze_lot, minimal_lot_analysis
 
     url = f"https://tbankrot.ru/item?id={lot_id}"
     lot = {
@@ -309,23 +309,52 @@ async def fetch_and_analyze_lot(lot_id: str):
         "is_extra": False, "source": "Т-Банкрот",
     }
     parsed_at = datetime.now()
+    login_ok = False
+
+    log.info("fetch_and_analyze_lot start id=%s url=%s", lot_id, url)
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
-        ctx = await browser.new_context(user_agent=(
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36"
-        ))
-        page = await ctx.new_page()
-        from agent import login
-        await login(page)
-        await enrich(lot, page, ctx, heavy=True)
-        await browser.close()
-    from database import record_digest_lot
-    dedup = record_digest_lot(lot_id, lot.get("price", 0))
-    if dedup.get("note"):
-        lot["dedup_note"] = dedup["note"]
-    an = await analyze_lot(lot)
+        browser = await launch_browser(p)
+        try:
+            ctx = await browser.new_context(user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36"
+            ))
+            page = await ctx.new_page()
+            login_ok = await login(page)
+            log.info("lot %s login_ok=%s", lot_id, login_ok)
+            try:
+                await enrich(lot, page, ctx, heavy=True)
+            except Exception:
+                log.exception("lot %s enrich failed (continuing with card data)", lot_id)
+        finally:
+            await browser.close()
+
+    if not lot.get("title") and not lot.get("description"):
+        raise RuntimeError(
+            f"Карточка лота {lot_id} пуста — страница не загрузилась или изменилась вёрстка"
+        )
+
+    lot["login_ok"] = login_ok
+    try:
+        from database import record_digest_lot
+        dedup = record_digest_lot(lot_id, lot.get("price", 0))
+        if dedup.get("note"):
+            lot["dedup_note"] = dedup["note"]
+    except Exception:
+        log.exception("lot %s record_digest_lot failed", lot_id)
+
+    try:
+        an = await analyze_lot(lot)
+    except Exception:
+        log.exception("lot %s analyze_lot failed, using minimal card", lot_id)
+        an = minimal_lot_analysis(lot)
+
     lot["parsed_at"] = parsed_at.isoformat()
+    log.info(
+        "fetch_and_analyze_lot done id=%s title=%r price=%s cadastral=%s login_ok=%s",
+        lot_id, (lot.get("title") or "")[:50], lot.get("price"),
+        lot.get("cadastral"), login_ok,
+    )
     return lot, an, parsed_at
 
 
@@ -631,29 +660,42 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     lot_id = extract_lot_id(text)
     if lot_id:
         from analyzer import format_short_lot_message, lot_action_keyboard
+        from telegram.error import BadRequest
         msg = await update.message.reply_text("⏳ Парсю и анализирую лот (~1 мин)...")
         try:
             lot, an, parsed_at = await fetch_and_analyze_lot(lot_id)
-            lot_cache[lot_id] = {
-                "lot": lot, "an": an,
-                "cadastral": lot.get("cadastral", ""),
-                "address": lot.get("address", ""),
-                "parsed_at": int(parsed_at.timestamp()),
-            }
-            kb = lot_action_keyboard(lot_id, an, lot, parsed_at)
+        except Exception as exc:
+            log.exception("link_analysis parse failed for lot %s: %r", lot_id, exc)
             await msg.edit_text(
-                format_short_lot_message(lot, an),
+                f"⚠️ Не удалось спарсить лот {lot_id}.\n\n"
+                f"Проверьте ссылку или попробуйте позже.\n"
+                f"Подробности — в логах Railway (link_analysis parse failed).",
+            )
+            return
+        lot_cache[lot_id] = {
+            "lot": lot, "an": an,
+            "cadastral": lot.get("cadastral", ""),
+            "address": lot.get("address", ""),
+            "parsed_at": int(parsed_at.timestamp()),
+        }
+        kb = lot_action_keyboard(lot_id, an, lot, parsed_at)
+        card_text = format_short_lot_message(lot, an)
+        try:
+            await msg.edit_text(
+                card_text,
                 parse_mode="Markdown",
                 reply_markup=kb,
                 disable_web_page_preview=True,
             )
+        except BadRequest:
+            log.exception("link_analysis markdown failed for lot %s, plain text", lot_id)
+            plain = card_text.replace("*", "").replace("_", "")
+            await msg.edit_text(plain, reply_markup=kb, disable_web_page_preview=True)
         except Exception:
-            log.exception("link_analysis failed for lot %s", lot_id)
+            log.exception("link_analysis send failed for lot %s", lot_id)
             await msg.edit_text(
-                f"⚠️ Не удалось спарсить лот *{lot_id}*.\n\n"
-                f"Проверьте ссылку или попробуйте позже.\n"
-                f"Подробности записаны в логи Railway.",
-                parse_mode="Markdown",
+                f"✅ Лот {lot_id} спарсен, но не удалось отправить карточку.\n"
+                f"{lot.get('title', '')[:80]}\n🔗 {lot.get('url', '')}",
             )
         return
 
@@ -673,7 +715,9 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await msg.edit_text(answer)
 
 def run():
+    from agent import ensure_playwright_env
     from database import init_db
+    ensure_playwright_env()
     init_db()
     app = Application.builder().token(TG_TOKEN).build()
     app.add_handler(CommandHandler("start", cmd_start))
