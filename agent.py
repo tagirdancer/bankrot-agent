@@ -758,13 +758,12 @@ def fmt_block(lot, an, i=0) -> str:
     doc_st = f"\n📄 _{an['document_status']}_" if an.get('document_status') else ""
     legal  = f"\n📋 {an['legal_text']}" if an.get('legal_text') else ""
     auto_s = f"\n🚗 {an['auto_summary']}" if an.get('auto_summary') else ""
-    simple = f"\n\n🎯 *{an['verdict_simple']}*" if an.get('verdict_simple') else ""
+    simple = ""
     region_note = " 🌍" if lot.get("is_extra") else ""
     price_line = an.get("price_line") or format_price_line(an)
     return (
         f"{medal} *{an.get('score_label','5/10')}*"
-        f" | {an.get('invest_text','📈 потенциал: средний')}"
-        f" | {an.get('risk_text','🟡 риск: средний')}"
+        f" | {an.get('risk_text','документы: —')}"
         f"{region_note}\n"
         f"{lot.get('title','')[:65]}\n"
         f"{price_line}"
