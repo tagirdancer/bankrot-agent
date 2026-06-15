@@ -175,7 +175,13 @@ def format_short_lot_message(lot: dict, an: dict, label: str = "ЛОТ") -> str:
     elif an.get("legal_text"):
         lines.append(f"📋 {an['legal_text'][:140]}")
     if an.get("document_risk_level"):
-        lines.append(f"📋 Риск по документам: {an['document_risk_level']}")
+        asc = an.get("assessment_score")
+        if asc is not None:
+            lines.append(
+                f"📋 Риск: {an['document_risk_level']} | оценка {asc}/100"
+            )
+        else:
+            lines.append(f"📋 Риск по документам: {an['document_risk_level']}")
     pluses = an.get("verdict_pluses") or []
     minuses = an.get("verdict_minuses") or []
     if pluses:
@@ -223,11 +229,65 @@ def is_real_estate(lot_type: str) -> bool:
     return lot_type in ("квартира", "апартаменты", "дом", "коммерция", "земля", "гараж")
 
 
+def _extract_encumbrances_detail(norm: str) -> tuple[str, bool]:
+    """Конкретная формулировка обременений из текста ЕГРН."""
+    tl = norm.lower()
+    if re.search(
+        r"нет\s+зарегистрированных\s+обремен|"
+        r"обременени[яе][^\n]{0,40}не\s+зарегистрир|"
+        r"сведения\s+об\s+отсутствии\s+обремен|"
+        r"не\s*зарегистрировано",
+        tl,
+    ):
+        if re.search(r"ограничени[^\n]{0,80}стать[^\n]{0,30}\d", tl):
+            pass
+        elif re.search(r"(?:вид|тип)\s*(?:обременени|ограничени)[^\n]{8,}", norm, re.I):
+            pass
+        else:
+            return "обременений не зарегистрировано", True
+
+    phrases: list[str] = []
+    enc_section = re.search(
+        r"Сведения об ограничениях прав[^\n]*\n([\s\S]{20,2000}?)(?:\n\s*\d+\.\s|\nСведения о|\Z)",
+        norm, re.I,
+    )
+    src = enc_section.group(1) if enc_section else norm
+
+    for pat in [
+        r"(ипотек[^\n]{0,100}(?:в\s+силу\s+закона|с\s+банком|[^\n]{0,40}))",
+        r"вид\s+обременени[яь][:\s]+([^\n]{5,140})",
+        r"вид\s+ограничени[яь][:\s]+([^\n]{5,140})",
+        r"(ограничени[яе]\s+прав[^\n]{0,120})",
+        r"(залог[^\n]{5,100})",
+        r"(сервитут[^\n]{5,80})",
+        r"(аренд[^\n]{5,80})",
+    ]:
+        for m in re.finditer(pat, src, re.I):
+            p = re.sub(r"\s{2,}", " ", (m.group(1) if m.lastindex else m.group(0)).strip())
+            p = p.strip(" :;,")
+            if len(p) > 8 and p.lower() not in {x.lower() for x in phrases}:
+                phrases.append(p[:140])
+
+    if phrases:
+        return "; ".join(phrases[:4])[:280], False
+
+    if re.search(r"ограничени[^\n]{0,30}прав[^\n]{0,80}стать", tl):
+        m = re.search(r"(ограничени[^\n]{0,120}стать[^\n]{0,40})", norm, re.I)
+        if m:
+            return re.sub(r"\s{2,}", " ", m.group(1).strip())[:200], False
+
+    if re.search(r"ипотек|залог|арест|сервитут", tl):
+        return "упоминание обременения без расшифровки — проверить выписку", False
+
+    return "не указано в распознанном тексте", False
+
+
 def parse_egrn_pdf(text: str) -> dict:
     """Извлекает поля из текста выписки ЕГРН (PDF/OCR)."""
     result = {
         "cadastral": "", "address": "", "area": "",
         "owner": "", "encumbrances": "", "share": "", "arrests": "",
+        "encumbrances_clean": False,
         "summary": "", "parsed_ok": False,
     }
     if not text or len(text) < 80:
@@ -293,36 +353,10 @@ def parse_egrn_pdf(text: str) -> dict:
     if sm:
         result["share"] = (sm.group(1) or sm.group(2) or "").strip()[:80]
 
-    # обременения / аресты
-    if re.search(
-        r"нет\s+зарегистрированных\s+обремен|"
-        r"обременени[яе]\s+не\s+зарегистрир|"
-        r"сведения\s+об\s+отсутствии\s+обремен",
-        norm, re.I,
-    ):
-        result["encumbrances"] = "нет (по тексту ЕГРН)"
-    else:
-        enc = []
-        enc_section = re.search(
-            r"Сведения об ограничениях прав[^\n]*\n([\s\S]{20,1200}?)(?:\n\s*\d+\.\s|\nСведения о)",
-            norm, re.I,
-        )
-        src_enc = enc_section.group(1) if enc_section else norm
-        for pat in [
-            r"вид\s+обременени[яь][:\s]+([^\n]{5,140})",
-            r"вид\s+ограничени[яь][:\s]+([^\n]{5,140})",
-            r"обременени[ея][:\s]+([^\n]{5,140})",
-            r"ипотек[^\n]{0,20}([^\n]{5,100})",
-            r"залог[^\n]{0,20}([^\n]{5,100})",
-        ]:
-            for m in re.finditer(pat, src_enc, re.IGNORECASE):
-                v = m.group(1).strip()
-                if v and v not in enc and len(v) > 4:
-                    enc.append(v[:90])
-        if enc:
-            result["encumbrances"] = "; ".join(enc[:4])[:240]
-        elif re.search(r"ипотек|залог|арест|сервитут|рента", norm, re.I):
-            result["encumbrances"] = "есть упоминания в тексте ЕГРН — проверить вручную"
+    # обременения / аресты — конкретная формулировка из текста
+    enc_detail, enc_clean = _extract_encumbrances_detail(norm)
+    result["encumbrances"] = enc_detail
+    result["encumbrances_clean"] = enc_clean
 
     if re.search(r"\barrest\b|арест\s|наложен\s+арест|запрещени[ея]\s+регистрац", norm, re.I):
         am = re.search(r"(арест[^\n]{5,120}|запрещени[ея][^\n]{5,120})", norm, re.I)
@@ -388,7 +422,7 @@ def _format_single_egrn_block(egrn: dict) -> str:
     return "\n".join(lines)
 
 
-def apply_appraisal_to_lot(lot: dict, pdf_text: str) -> None:
+def apply_appraisal_to_lot(lot: dict, pdf_text: str, method: str = "", source_title: str = "") -> None:
     """Парсит отчёт об оценке и дополняет lot."""
     try:
         from appraisal_pdf import parse_appraisal_pdf
@@ -397,6 +431,10 @@ def apply_appraisal_to_lot(lot: dict, pdf_text: str) -> None:
     lot["pdf_from_appraisal"] = True
     lot["appraisal_pdf_text"] = pdf_text
     parsed = parse_appraisal_pdf(pdf_text)
+    if method:
+        parsed["extract_method"] = method
+    if source_title:
+        parsed["source_title"] = source_title
     lot["appraisal_parsed"] = parsed
     if parsed.get("parsed_ok"):
         lot["appraisal_read_ok"] = True
@@ -475,7 +513,7 @@ def apply_lot_document(
     if doc_type == "egrn":
         apply_egrn_to_lot(lot, text, True, source_title=title, method=method)
     elif doc_type == "appraisal":
-        apply_appraisal_to_lot(lot, text)
+        apply_appraisal_to_lot(lot, text, method=method, source_title=title)
         if method:
             lot["appraisal_extract_method"] = method
     elif doc_type == "contract":
@@ -1497,7 +1535,9 @@ async def analyze_lot(lot: dict, light: bool = False) -> dict:
         "facts_json": vr["facts_json"],
         "risk_score": vr["risk_score"],
         "risk_level": vr["risk_level"],
-        "invest_score": vr.get("invest_score"),
+        "assessment_score": vr.get("assessment_score"),
+        "assessment_logic": vr.get("assessment_logic", ""),
+        "invest_score": vr.get("assessment_score"),
         "document_risk_level": vr.get("document_risk_level"),
         "verdict_pluses": vr.get("verdict_pluses", []),
         "verdict_minuses": vr.get("verdict_minuses", []),
