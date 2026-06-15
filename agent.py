@@ -172,9 +172,33 @@ async def _fetch_pdf_bytes(page, url: str) -> bytes:
     return b""
 
 
+def _legacy_discover_pdf_urls(lot_id: str) -> list:
+    return [
+        f"https://files.tbankrot.ru/egrn_files/{lot_id}.pdf",
+        f"https://tbankrot.ru/files/egrn/{lot_id}.pdf",
+        f"https://tbankrot.ru/item/egrn?id={lot_id}",
+    ]
+
+
+def _legacy_extract_pdf_text(raw: bytes) -> tuple[str, str]:
+    try:
+        with pdfplumber.open(io.BytesIO(raw)) as pdf:
+            parts = [(p.extract_text() or "") for p in pdf.pages[:8]]
+        text = "\n".join(parts).strip()
+        if len(text) >= 80:
+            return text[:12000], "text"
+    except Exception as e:
+        print(f"    PDF text layer: {e}")
+    return "", "failed"
+
+
 async def _try_egrn_pdf(lot, page, ctx):
     from analyzer import apply_egrn_to_lot
-    from egrn_pdf import extract_pdf_text, discover_pdf_urls
+    extract_pdf_text = discover_pdf_urls = None
+    try:
+        from egrn_pdf import extract_pdf_text, discover_pdf_urls
+    except ImportError as e:
+        print(f"    egrn_pdf недоступен ({e}), только pdfplumber")
 
     desc = (lot.get("description") or "").lower()
     lot["has_egrn_on_site"] = any(x in desc for x in (
@@ -185,7 +209,10 @@ async def _try_egrn_pdf(lot, page, ctx):
         html = await page.content()
     except Exception:
         pass
-    urls = discover_pdf_urls(html, lot["id"])
+    if discover_pdf_urls:
+        urls = discover_pdf_urls(html, lot["id"])
+    else:
+        urls = _legacy_discover_pdf_urls(lot["id"])
     got_pdf = False
 
     for pdf_url in urls:
@@ -200,7 +227,10 @@ async def _try_egrn_pdf(lot, page, ctx):
                 continue
             got_pdf = True
             lot["has_egrn_on_site"] = True
-            text, method = extract_pdf_text(raw)
+            if extract_pdf_text:
+                text, method = extract_pdf_text(raw)
+            else:
+                text, method = _legacy_extract_pdf_text(raw)
             lot["egrn_extract_method"] = method
             if text and len(text) >= 80:
                 apply_egrn_to_lot(lot, text, True)
@@ -291,6 +321,9 @@ async def enrich_heavy(lot, page, ctx):
                 await asyncio.wait_for(_try_egrn_pdf(lot, page, ctx), timeout=PDF_TIMEOUT)
             except asyncio.TimeoutError:
                 lot["pdf_timeout"] = True
+            except Exception as e:
+                print(f"    EGRN step skipped: {e}")
+                lot["pdf_download_failed"] = True
 
 
 async def enrich(lot, page, ctx, heavy: bool = True):
@@ -302,6 +335,9 @@ async def enrich(lot, page, ctx, heavy: bool = True):
             await asyncio.wait_for(_try_egrn_pdf(lot, page, ctx), timeout=PDF_TIMEOUT)
         except asyncio.TimeoutError:
             lot["pdf_timeout"] = True
+        except Exception as e:
+            print(f"    EGRN step skipped: {e}")
+            lot["pdf_download_failed"] = True
 
 
 def fmt_block(lot, an, i=0) -> str:
