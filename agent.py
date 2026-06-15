@@ -268,7 +268,12 @@ async def _submit_login_form(page) -> str:
         return ""
 
 
+LAST_LOGIN_REASON = ""
+
+
 async def login(page) -> bool:
+    global LAST_LOGIN_REASON
+    LAST_LOGIN_REASON = ""
     login_set = bool(LOGIN and LOGIN.strip())
     pwd_set = bool(PASSWORD and PASSWORD.strip())
     log.info("[login] TBANKROT_LOGIN set=%s TBANKROT_PASSWORD set=%s", login_set, pwd_set)
@@ -341,8 +346,10 @@ async def login(page) -> bool:
         ok, reason = await _confirm_login(page, check_lot_wall=True)
         if ok:
             log.info("[login] OK — %s (submit=%s)", reason, submit_reason)
+            LAST_LOGIN_REASON = reason
         else:
             log.warning("[login] NOT CONFIRMED — %s (submit=%s)", reason, submit_reason)
+            LAST_LOGIN_REASON = submit_reason if submit_reason not in ("ajax_success", "fetch_success") else reason
         return ok
     except Exception:
         log.exception("[login] FAIL")
