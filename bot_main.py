@@ -719,6 +719,11 @@ def run():
     from database import init_db
     ensure_playwright_env()
     init_db()
+    try:
+        from egrn_pdf import ocr_available
+        log.info("OCR startup: available=%s", ocr_available())
+    except Exception as e:
+        log.warning("OCR startup check failed: %s", e)
     app = Application.builder().token(TG_TOKEN).build()
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("menu",  cmd_menu))
