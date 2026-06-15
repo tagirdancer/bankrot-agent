@@ -434,7 +434,7 @@ async def _try_lot_pdfs(lot, page, ctx):
     from analyzer import apply_egrn_to_lot, apply_appraisal_to_lot, apply_lot_document
     extract_pdf_text = None
     try:
-        from egrn_pdf import extract_pdf_text
+        from egrn_pdf import extract_pdf_text, extract_appraisal_pdf_text
         from lot_documents import (
             discover_lot_documents, classify_document, extract_docx_text,
             parse_document_content, IMAGE_EXTS, READABLE_EXTS,
@@ -500,11 +500,31 @@ async def _try_lot_pdfs(lot, page, ctx):
                 text, method = extract_docx_text(raw)
                 entry["ext"] = "docx"
             elif ext == "pdf" or raw[:4] == b"%PDF":
-                if extract_pdf_text:
+                doc_type_pre = classify_document(title, url, "", "pdf")
+                is_appr = doc_type_pre == "appraisal" or bool(
+                    re.search(r"отч[её]t|оцен", title, re.I)
+                    and "егрн" not in title.lower()
+                )
+                if is_appr:
+                    text, method = extract_appraisal_pdf_text(raw)
+                    if len(text or "") < 80:
+                        text2, method2 = extract_appraisal_pdf_text(raw)
+                        if len(text2 or "") > len(text or ""):
+                            text, method = text2, method2
+                            log.info("appraisal OCR retry: %d chars method=%s", len(text), method)
+                elif extract_pdf_text:
                     text, method = extract_pdf_text(raw)
                 else:
                     text, method = _legacy_extract_pdf_text(raw)
                 entry["ext"] = "pdf"
+                if is_appr and len(text or "") < 80:
+                    try:
+                        from egrn_pdf import ocr_available
+                        entry["ocr_available"] = ocr_available()
+                        if not entry["ocr_available"]:
+                            log.warning("appraisal OCR unavailable for %r", title[:60])
+                    except ImportError:
+                        entry["ocr_available"] = False
             elif raw[:4] == b"%PDF":
                 text, method = extract_pdf_text(raw) if extract_pdf_text else _legacy_extract_pdf_text(raw)
             else:
