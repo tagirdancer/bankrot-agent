@@ -9,6 +9,7 @@ aptPkgs = [
   "libgbm1", "libasound2t64", "libpango-1.0-0", "libcairo2", "fonts-liberation",
   "libxfixes3", "libx11-6", "libx11-xcb1", "libxcb1", "libxext6", "libxi6",
   "libxtst6", "libgtk-3-0", "libgdk-pixbuf-2.0-0",
+  "tesseract-ocr", "tesseract-ocr-rus", "tesseract-ocr-eng",
 ]
 
 [phases.playwright]
