@@ -12,6 +12,10 @@ aptPkgs = [
   "tesseract-ocr", "tesseract-ocr-rus", "tesseract-ocr-eng",
 ]
 
+[phases.tesseract-check]
+dependsOn = ["setup"]
+cmds = ["which tesseract", "tesseract --version"]
+
 [phases.playwright]
 dependsOn = ["install"]
 cmds = ["playwright install chromium"]
