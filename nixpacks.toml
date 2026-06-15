@@ -1,6 +1,4 @@
-# Playwright needs browser binaries at build time (not only pip package).
-[phases.install]
-cmds = [
-  "pip install -r requirements.txt",
-  "playwright install --with-deps chromium",
-]
+# Install Chromium after default Python/pip install (do not override install phase).
+[phases.playwright]
+dependsOn = ["install"]
+cmds = ["playwright install --with-deps chromium"]
