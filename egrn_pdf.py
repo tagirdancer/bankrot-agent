@@ -17,13 +17,26 @@ MAX_APPRAISAL_TEXT = 35000
 
 
 def ocr_available() -> bool:
+    return ocr_status()[0]
+
+
+def ocr_status() -> tuple[bool, str]:
+    """(available, reason) — для логов при старте."""
+    missing: list[str] = []
     try:
         import fitz  # noqa: F401
+    except ImportError:
+        missing.append("pymupdf/fitz")
+    try:
         import pytesseract  # noqa: F401
         from PIL import Image  # noqa: F401
     except ImportError:
-        return False
-    return bool(shutil.which("tesseract"))
+        missing.append("pytesseract/Pillow")
+    if not shutil.which("tesseract"):
+        missing.append("tesseract binary")
+    if missing:
+        return False, ", ".join(missing)
+    return True, "ok"
 
 
 def extract_pdf_text(raw: bytes, max_pages: int = 8) -> tuple[str, str]:
