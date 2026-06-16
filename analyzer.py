@@ -812,7 +812,13 @@ def _resolve_market_from_documents(lot: dict, area_sqm: float, lot_type: str) ->
     if text and ("аналитик" in text.lower() and "торг" in text.lower()):
         lot["trading_analytics"] = parse_trading_analytics(text)
 
-    ta_mkt = compute_trading_market(lot_type, area_sqm, text)
+    exclude: set[int] = set()
+    for rec in lot.get("egrn_records") or []:
+        cv = int(rec.get("cadastral_value") or 0)
+        if cv > 0:
+            exclude.add(cv)
+
+    ta_mkt = compute_trading_market(lot_type, area_sqm, text, exclude_prices=exclude)
     if ta_mkt.get("market_price", 0) > 0:
         return {
             "market_price": ta_mkt["market_price"],
@@ -874,7 +880,7 @@ def format_price_line(an: dict) -> str:
         ppm_s = f"{ppm:,} ₽".replace(",", " ") if ppm else "?"
         n = an.get("n_analogs") or 0
         coarse = an.get("market_coarse")
-        coarse_s = " _мало аналогов, ориентир грубый_" if coarse else ""
+        coarse_s = " (мало аналогов, ориентир грубый)" if coarse else ""
         return (
             f"💰 цена лота {price}, похожие лоты рядом ~{ppm_s}/м² "
             f"(медиана по {n} аналогам) → ориентир {mkt}{disc_s}{coarse_s} "
