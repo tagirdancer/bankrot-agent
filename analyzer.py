@@ -275,7 +275,7 @@ def _egrn_encumbrance_sections(norm: str) -> str:
 
 
 def _summarize_egrn_encumbrances(lot: dict) -> str:
-    records = list(lot.get("egrn_records") or [])
+    records = dedupe_egrn_records(list(lot.get("egrn_records") or []))
     if not records:
         egrn = lot.get("egrn_parsed") or {}
         return _clean_field_text(egrn.get("encumbrances") or "", 100)
@@ -450,7 +450,7 @@ def format_egrn_legal_block(egrn: dict) -> str:
     """Читаемый блок юридических данных из ЕГРН (один объект или несколько)."""
     if not egrn:
         return ""
-    objects = egrn.get("objects") or []
+    objects = dedupe_egrn_records(egrn.get("objects") or [])
     if objects:
         lines = []
         for i, obj in enumerate(objects, 1):
@@ -508,8 +508,59 @@ def apply_appraisal_to_lot(lot: dict, pdf_text: str, method: str = "", source_ti
         log.exception("apply_appraisal_to_lot failed for lot %s", lot.get("id", ""))
 
 
+def _normalize_cadastral(cad: str) -> str:
+    return re.sub(r"\s+", "", str(cad or "").strip())
+
+
+def _egrn_record_quality(rec: dict) -> int:
+    score = 0
+    if rec.get("parsed_ok"):
+        score += 100
+    if rec.get("encumbrances_clean"):
+        score += 20
+    for key in ("encumbrances", "address", "owner", "area"):
+        score += min(len(str(rec.get(key) or "")), 40)
+    return score
+
+
+def _merge_egrn_duplicate(primary: dict, other: dict) -> dict:
+    """Сливает две выписки на один кадастр — оставляет более полную."""
+    keep = primary if _egrn_record_quality(primary) >= _egrn_record_quality(other) else other
+    drop = other if keep is primary else primary
+    merged = dict(keep)
+    for key in ("address", "area", "owner", "encumbrances", "share", "arrests", "summary"):
+        if not merged.get(key) and drop.get(key):
+            merged[key] = drop[key]
+    if drop.get("parsed_ok"):
+        merged["parsed_ok"] = True
+    if drop.get("encumbrances_clean"):
+        merged["encumbrances_clean"] = True
+    return merged
+
+
+def dedupe_egrn_records(records: list[dict]) -> list[dict]:
+    """Один кадастровый номер = один объект (дубли выписки сливаются)."""
+    by_cad: dict[str, dict] = {}
+    order: list[str] = []
+    no_cad: list[dict] = []
+    for rec in records or []:
+        if not rec:
+            continue
+        cad = _normalize_cadastral(rec.get("cadastral") or "")
+        if not cad:
+            no_cad.append(rec)
+            continue
+        if cad not in by_cad:
+            by_cad[cad] = dict(rec)
+            order.append(cad)
+        else:
+            by_cad[cad] = _merge_egrn_duplicate(by_cad[cad], rec)
+    return [by_cad[c] for c in order] + no_cad
+
+
 def _merge_egrn_records(records: list[dict]) -> dict:
     """Сводка по нескольким выпискам ЕГРН."""
+    records = dedupe_egrn_records(records)
     merged = {
         "objects": records,
         "cadastral": "", "address": "", "area": "",
@@ -553,6 +604,7 @@ def apply_egrn_to_lot(
 
     records = list(lot.get("egrn_records") or [])
     records.append(egrn)
+    records = dedupe_egrn_records(records)
     lot["egrn_records"] = records
     lot["egrn_parsed"] = _merge_egrn_records(records)
 
@@ -596,7 +648,7 @@ def resolve_document_status(lot: dict) -> str:
     appr = lot.get("appraisal_parsed") or {}
     docs = lot.get("lot_documents") or lot.get("pdfs_downloaded") or []
     n_total = lot.get("documents_downloaded_count") or len([d for d in docs if d.get("download_ok")])
-    n_egrn = len(lot.get("egrn_records") or egrn.get("objects") or [])
+    n_egrn = len(dedupe_egrn_records(lot.get("egrn_records") or egrn.get("objects") or []))
     parts = []
 
     if lot.get("egrn_read_ok") or (lot.get("pdf_from_egrn") and egrn.get("parsed_ok")):
