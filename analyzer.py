@@ -20,7 +20,7 @@ GROQ_KEY = os.getenv("GROQ_API_KEY")
 COOKIES  = os.getenv("TBANKROT_COOKIES", "")
 MODEL    = "llama-3.1-8b-instant"
 MIN_SCORE = 0.0
-MIN_DISCOUNT_PCT = float(os.getenv("MIN_DISCOUNT_PCT", "30"))
+MIN_DISCOUNT_PCT = float(os.getenv("MIN_DISCOUNT_PCT", "15"))
 
 REGION_LABELS = {
     "moskva": "Москва", "moskovskaya-oblast": "Московская область",
