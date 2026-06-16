@@ -525,7 +525,10 @@ async def _try_lot_pdfs(lot, page, ctx):
                             text, method = text2, method2
                             log.info("appraisal OCR retry: %d chars method=%s", len(text), method)
                 elif extract_pdf_text:
-                    text, method = extract_pdf_text(raw)
+                    if len(raw) > 400_000:
+                        text, method = extract_appraisal_pdf_text(raw)
+                    else:
+                        text, method = extract_pdf_text(raw)
                 else:
                     text, method = _legacy_extract_pdf_text(raw)
                 entry["ext"] = "pdf"
