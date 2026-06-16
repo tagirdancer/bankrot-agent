@@ -766,9 +766,22 @@ def run():
     ensure_playwright_env()
     init_db()
     try:
-        from egrn_pdf import ocr_status
-        ok, reason = ocr_status()
-        log.info("OCR startup: available=%s reason=%s", ok, reason)
+        from egrn_pdf import ocr_diagnostics
+        d = ocr_diagnostics()
+        if d["tesseract"] == "NOT FOUND":
+            log.info("OCR check: tesseract NOT FOUND (%s)", d.get("reason", ""))
+        else:
+            log.info(
+                "OCR check: tesseract version = %s (path=%s)",
+                d.get("tesseract_version") or "?",
+                d["tesseract"],
+            )
+        log.info(
+            "OCR check: pymupdf=%s version=%s pytesseract=%s pillow=%s",
+            d["pymupdf"], d.get("pymupdf_version", "?"),
+            d["pytesseract"], d["pillow"],
+        )
+        log.info("OCR startup: available=%s reason=%s", d["available"], d["reason"])
     except Exception as e:
         log.warning("OCR startup check failed: %s", e)
     app = Application.builder().token(TG_TOKEN).build()
