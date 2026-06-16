@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import re
+import statistics
 
 MIN_TEXT = 60
 
@@ -37,8 +38,8 @@ def _parse_money_near(text: str, label_pat: str) -> int:
     m = re.search(label_pat, text, re.I | re.S)
     if not m:
         return 0
-    chunk = m.group(0)[:500]
-    for pm in re.finditer(r"(\d[\d\s]{4,11})(?:[.,](\d{2}))?\s*(?:₽|руб)", chunk, re.I):
+    chunk = text[m.start(): m.start() + 500]
+    for pm in re.finditer(r"(\d[\d\s]{4,11})(?:[.,](\d{2}))?\s*(?:₽|руб|p\.|P\.)?", chunk, re.I):
         v = int(re.sub(r"\s", "", pm.group(1)))
         if 100_000 <= v <= 2_000_000_000:
             return v
@@ -49,30 +50,78 @@ def _parse_money_near(text: str, label_pat: str) -> int:
     return 0
 
 
-def _extract_comparables(norm: str) -> tuple[str, list[int]]:
+def _scan_price_numbers(blob: str) -> list[int]:
+    """Цены из таблицы объявлений — допускает OCR без символа ₽."""
     prices: list[int] = []
+    seen: set[int] = set()
+    for pm in re.finditer(
+        r"(?<!\d)(\d[\d\s]{5,10})(?:[.,](\d{2}))?(?:\s*(?:₽|руб|p\.|P\.))?",
+        blob,
+        re.I,
+    ):
+        v = int(re.sub(r"\s", "", pm.group(1)))
+        if 200_000 <= v <= 500_000_000 and v not in seen:
+            seen.add(v)
+            prices.append(v)
+    return prices
+
+
+def _fmt_mln(v: int) -> str:
+    if v >= 1_000_000:
+        return f"{v / 1_000_000:.1f} млн ₽"
+    return f"{v:,} ₽".replace(",", " ")
+
+
+def _extract_comparables(norm: str) -> tuple[str, list[int], int]:
+    """
+    Раздел «Объявления» — цены аналогов.
+    Возвращает (диапазон-текст, список цен, медиана).
+    """
+    prices: list[int] = []
+    section = ""
     for pat in (
-        r"(?:объявлени[яе]|сопоставим|аналог)[^\n]{0,100}\n([\s\S]{50,2500}?)"
-        r"(?:\n\s*(?:\d+\.|Аналитик|Судебн|Заключ|\d+\s+Вывод)|\Z)",
-        r"(?:рынок[^\n]{0,40}объявлен)[^\n]{0,80}\n([\s\S]{50,2000}?)(?:\nАналитик|\Z)",
+        r"(?:об[ъo]явлен[^\n]{0,60})\n([\s\S]{80,4500}?)"
+        r"(?:\n\s*(?:\d+\.|аналитик|судебн|заключ|вывод|\d+\s+вывод)|\Z)",
+        r"(?:рынок[^\n]{0,50}об[ъo]явлен)[^\n]{0,80}\n([\s\S]{80,3000}?)(?:\nаналитик|\Z)",
+        r"(?:сопоставим[^\n]{0,40}об[ъo]ект)[^\n]{0,80}\n([\s\S]{80,3000}?)(?:\nаналитик|\Z)",
     ):
         comp = re.search(pat, norm, re.I)
         if comp:
-            for pm in re.finditer(r"(\d[\d\s]{5,11})\s*(?:₽|руб)", comp.group(1), re.I):
-                v = int(re.sub(r"\s", "", pm.group(1)))
-                if 100_000 <= v <= 2_000_000_000:
-                    prices.append(v)
-            if prices:
+            section = comp.group(1)
+            prices = _scan_price_numbers(section)
+            if len(prices) >= 2:
                 break
+
+    if len(prices) < 2:
+        idx = norm.lower().find("объявлен")
+        if idx < 0:
+            idx = norm.lower().find("объявлени")
+        if idx >= 0:
+            blob = norm[idx: idx + 5000]
+            extra = _scan_price_numbers(blob)
+            if len(extra) > len(prices):
+                prices = extra
+
+    if not prices:
+        return "не указано", [], 0
+
+    med = int(statistics.median(prices))
     if len(prices) >= 2:
-        return (
-            f"{min(prices)/1e6:.1f}–{max(prices)/1e6:.1f} млн ₽ "
-            f"({len(prices)} объявлений в отчёте)",
-            prices,
-        )
-    if len(prices) == 1:
-        return f"~{prices[0]/1e6:.1f} млн ₽ (1 объявление)", prices
-    return "не указано", prices
+        rng = f"{_fmt_mln(min(prices))}–{_fmt_mln(max(prices))} ({len(prices)} объявл.)"
+    else:
+        rng = f"~{_fmt_mln(prices[0])} (1 объявл.)"
+    return rng, prices, med
+
+
+def _extract_cadastral_value(norm: str) -> int:
+    for pat in (
+        r"кадастров[\s\S]{0,80}?стоим",
+        r"кадастров[\s\S]{0,40}оцен",
+    ):
+        v = _parse_money_near(norm, pat)
+        if v:
+            return v
+    return 0
 
 
 def _extract_auction_analytics(norm: str) -> dict:
@@ -99,14 +148,63 @@ def _extract_auction_analytics(norm: str) -> dict:
     return out
 
 
+def resolve_market_orientir(parsed: dict, lot_cadastral_value: int = 0) -> dict:
+    """
+    Единый рыночный ориентир из распознанного отчёта.
+    Приоритет: рыночная оценка отчёта → медиана объявлений → кадастровая стоимость.
+    """
+    out = {
+        "price": 0,
+        "source": "",
+        "label": "",
+        "disclaimer": "",
+        "comparables_range": parsed.get("comparables_range", "не указано"),
+        "comparables_median": parsed.get("comparables_median", 0),
+    }
+    mp = int(parsed.get("market_price") or parsed.get("appraisal_price") or 0)
+    if mp > 0:
+        out.update(
+            price=mp,
+            source="appraisal_valuation",
+            label="рыночная оценка отчёта",
+            disclaimer="из отчёта об оценке",
+        )
+        return out
+
+    med = int(parsed.get("comparables_median") or 0)
+    if med > 0:
+        out.update(
+            price=med,
+            source="appraisal_comparables",
+            label=f"аналоги {parsed.get('comparables_range', '')}",
+            disclaimer="ориентир по объявлениям из отчёта, проверить",
+        )
+        return out
+
+    cv = int(parsed.get("cadastral_value") or lot_cadastral_value or 0)
+    if cv > 0:
+        out.update(
+            price=cv,
+            source="cadastral_coarse",
+            label="кадастровая стоимость",
+            disclaimer="грубо, по кадастру",
+        )
+        return out
+    return out
+
+
 def parse_appraisal_pdf(text: str) -> dict:
     """Извлекает поля из отчёта об оценке. Нет данных → 'не указано'."""
     result = {
         "market_price": 0,
         "liquidation_price": 0,
         "appraisal_price": 0,
+        "cadastral_value": 0,
         "comparables_range": "не указано",
         "comparables_prices": [],
+        "comparables_median": 0,
+        "comparables_min": 0,
+        "comparables_max": 0,
         "auction_avg_reduction_pct": "не указано",
         "auction_participants_hint": "не указано",
         "auction_analytics_snippet": "",
@@ -145,9 +243,15 @@ def parse_appraisal_pdf(text: str) -> dict:
             norm, r"стоимость объекта оценки",
         )
 
-    comp_range, comp_prices = _extract_comparables(norm)
+    result["cadastral_value"] = _extract_cadastral_value(norm)
+
+    comp_range, comp_prices, comp_med = _extract_comparables(norm)
     result["comparables_range"] = comp_range
     result["comparables_prices"] = comp_prices
+    result["comparables_median"] = comp_med
+    if comp_prices:
+        result["comparables_min"] = min(comp_prices)
+        result["comparables_max"] = max(comp_prices)
 
     analytics = _extract_auction_analytics(norm)
     result["auction_avg_reduction_pct"] = analytics["avg_reduction_pct"]
@@ -176,11 +280,8 @@ def parse_appraisal_pdf(text: str) -> dict:
             flags.append(label)
     result["restriction_flags"] = flags
 
-    best_price = (
-        result["market_price"]
-        or result["appraisal_price"]
-        or result["liquidation_price"]
-    )
+    orient = resolve_market_orientir(result)
+    best_price = orient.get("price") or 0
     result["parsed_ok"] = best_price > 0 or any(
         x not in ("", "не указано") for x in (
             result["comparables_range"],
@@ -196,12 +297,18 @@ def parse_appraisal_pdf(text: str) -> dict:
             f"{result.get('market_price_label') or 'рыночная'} "
             f"{result['market_price']/1e6:.2f} млн ₽"
         )
+    elif result["comparables_median"]:
+        parts.append(
+            f"аналоги (мед. {_fmt_mln(result['comparables_median'])}): {result['comparables_range']}"
+        )
     elif result["appraisal_price"]:
         parts.append(f"оценочная {result['appraisal_price']/1e6:.2f} млн ₽")
     if result["liquidation_price"]:
         parts.append(f"ликвидационная {result['liquidation_price']/1e6:.2f} млн ₽")
-    if result["comparables_range"] != "не указано":
-        parts.append(f"аналоги: {result['comparables_range']}")
+    if result["cadastral_value"] and not result["market_price"]:
+        parts.append(f"кадастр {_fmt_mln(result['cadastral_value'])}")
+    if result["comparables_range"] != "не указано" and result["comparables_median"]:
+        parts.append(f"объявления: {result['comparables_range']}")
     if result["auction_avg_reduction_pct"] != "не указано":
         parts.append(f"снижение на торгах: {result['auction_avg_reduction_pct']}")
     if flags:
