@@ -181,6 +181,9 @@ def _parse_trading_table_row(line: str) -> dict | None:
     line = re.sub(r"\s+", " ", _clean_html(line)).strip()
     if len(line) < 12:
         return None
+    ll = line.lower()
+    if "кадастров" in ll:
+        return None
     if line.lower().startswith(("объект ", "текущая цена", "тип ", "статус")):
         return None
     area_m = re.search(r"(\d+[.,]?\d*)\s*(?:м²|м2|кв\.?\s*м|кв\.м)", line, re.I)
@@ -286,10 +289,16 @@ def parse_trading_analytics(text: str) -> dict:
     return result
 
 
-def compute_trading_market(lot_type: str, area_sqm: float, text: str) -> dict:
+def compute_trading_market(
+    lot_type: str,
+    area_sqm: float,
+    text: str,
+    exclude_prices: set[int] | None = None,
+) -> dict:
     """
     Рыночный ориентир из таблицы соседних лотов (аналитика торгов).
     Медиана ₽/м² по аналогам того же типа и площади ±30%.
+    Кадастровая стоимость в exclude_prices — не используется как аналог.
     """
     empty = {
         "market_price": 0,
@@ -306,33 +315,51 @@ def compute_trading_market(lot_type: str, area_sqm: float, text: str) -> dict:
 
     ta = parse_trading_analytics(text)
     rows = ta.get("table_rows") or []
+    if exclude_prices:
+        filt: list[dict] = []
+        for r in rows:
+            p = r["price"]
+            if p in exclude_prices:
+                continue
+            if any(abs(p - ex) / ex < 0.02 for ex in exclude_prices if ex > 0):
+                continue
+            filt.append(r)
+        rows = filt
     if not rows:
         return empty
 
     lo, hi = area_sqm * 0.7, area_sqm * 1.3
-    analogs = [
+    typed = [
         r for r in rows
         if _types_compatible(lot_type, r.get("type") or "")
         and lo <= r["area_sqm"] <= hi
     ]
-    open_only = [r for r in analogs if "заверш" not in (r.get("status") or "").lower()]
-    if open_only:
-        analogs = open_only
-    if not analogs:
+    if not typed:
         return empty
+
+    open_rows = [r for r in typed if "заверш" not in (r.get("status") or "").lower()]
+    analogs = open_rows if open_rows else typed
+    if len(open_rows) >= 1 and len(open_rows) < 3:
+        seen = {(r["price"], round(r["area_sqm"], 1)) for r in analogs}
+        for r in typed:
+            if "заверш" in (r.get("status") or "").lower():
+                key = (r["price"], round(r["area_sqm"], 1))
+                if key not in seen:
+                    analogs.append(r)
+                    seen.add(key)
 
     tol = max(1.0, area_sqm * 0.02)
     exact = [r for r in analogs if abs(r["area_sqm"] - area_sqm) <= tol]
     if exact:
         analogs = exact
 
+    if not analogs:
+        return empty
+
     ppms = [r["price"] / r["area_sqm"] for r in analogs]
     med_ppm = statistics.median(ppms)
     orientir = int(med_ppm * area_sqm)
     coarse = len(analogs) < 3
-
-    if coarse and len(analogs) < 1:
-        return empty
 
     comment = "по аналогичным лотам рядом (аналитика торгов)"
     if coarse:
