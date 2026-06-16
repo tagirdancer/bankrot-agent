@@ -66,86 +66,56 @@ def _egrn_object_line(rec: dict, idx: int) -> dict:
 
 
 def _build_market_comparison(lot: dict, an: dict, appr: dict) -> dict:
-    """Сравнение цены лота с рынком — только если рынок из отчёта/документов."""
-    from appraisal_pdf import resolve_market_orientir
-
+    """Сравнение цены лота с рынком — аналитика торгов или отчёт оценщика."""
     price_lot = float(lot.get("price") or an.get("lot_price_raw") or 0)
-    lot_cv = 0
-    for rec in lot.get("egrn_records") or []:
-        cv = int(rec.get("cadastral_value") or 0)
-        if cv > 0:
-            lot_cv = cv
-            break
-
-    orient = resolve_market_orientir(appr or {}, lot_cv)
-    market = int(
-        orient.get("price")
-        or appr.get("market_price")
-        or appr.get("appraisal_price")
-        or an.get("market_price_raw")
-        or 0
-    )
-    source = ""
-    disclaimer = orient.get("disclaimer") or ""
-    src_key = orient.get("source") or an.get("market_source") or ""
-
-    if src_key == "appraisal_comparables" and market > 0:
-        source = "раздел «Объявления», отчёт об оценке"
-    elif src_key == "cadastral_coarse" and market > 0:
-        source = "кадастровая стоимость (грубо)"
-    elif appr.get("parsed_ok") and (appr.get("market_price") or appr.get("appraisal_price")):
-        source = f"отчёт об оценке ({appr.get('extract_method') or 'текст'})"
-        if appr.get("source_title"):
-            source += f": {appr['source_title'][:60]}"
-    elif an.get("market_source") == "appraisal_valuation":
-        source = "отчёт об оценке (карточка)"
-    elif an.get("market_known") and an.get("market_source"):
-        source = f"ориентир {an.get('market_source')} — не из отчёта"
-        market = int(an.get("market_price_raw") or 0)
+    src_key = an.get("market_source") or ""
+    market = int(an.get("market_price_raw") or 0)
 
     if not market or market <= 0:
         return {
             "known": False,
-            "lines": ["Рынок не определён — отчёт не распознан или стоимость не извлечена"],
+            "lines": ["Рынок не определён — мало аналогов в аналитике торгов или нет данных"],
             "discount_pct": None,
         }
 
     lines = []
-    cr = appr.get("comparables_range", "не указано")
-    med = int(appr.get("comparables_median") or 0)
-    if src_key == "appraisal_comparables" and cr != "не указано":
+    if src_key == "trading_analytics":
+        ppm = int(an.get("median_ppm") or 0)
+        n = int(an.get("n_analogs") or 0)
+        coarse = an.get("market_coarse")
         lines.append(
-            f"Цена лота: {_fmt_money(price_lot)}; аналоги рядом {cr}"
-            + (f" (мед. {_fmt_money(med)})" if med else "")
+            f"Цена лота: {_fmt_money(price_lot)}; похожие лоты рядом "
+            f"~{f'{ppm:,} ₽'.replace(',', ' ')}/м² (медиана по {n} аналогам)"
         )
-        if disclaimer:
-            lines.append(f"_{disclaimer}_")
+        lines.append(f"Ориентир: {_fmt_money(market)}")
+        lines.append("_по аналогичным лотам рядом (аналитика торгов)_")
+        if coarse:
+            lines.append("_мало аналогов, ориентир грубый_")
     else:
-        lines.append(f"Рыночная оценка: {_fmt_money(market)} — источник: {source or 'отчёт'}")
+        source = "отчёт об оценке" if src_key == "appraisal_valuation" else src_key
+        lines.append(f"Рыночная оценка: {_fmt_money(market)} — источник: {source}")
+        lines.append(f"Цена лота: {_fmt_money(price_lot)}")
 
     if price_lot > 0:
         disc = round((market - price_lot) / market * 100) if market > price_lot else 0
         premium = round((price_lot - market) / market * 100) if price_lot > market else 0
-        if src_key != "appraisal_comparables":
-            lines.append(f"Цена лота: {_fmt_money(price_lot)}")
         if disc > 0:
             lines.append(f"Ориентировочный дисконт: {disc}%")
         elif premium > 0:
             lines.append(f"Лот дороже ориентира на {premium}%")
-        else:
+        elif src_key != "trading_analytics":
             lines.append("Цена лота равна ориентиру")
     else:
         disc = None
         lines.append("Цена лота на сайте не определена — дисконт не считается")
 
-    if cr != "не указано" and src_key != "appraisal_comparables":
-        lines.append(f"По аналогам (раздел «Объявления», отчёт): {cr}")
-    if appr.get("auction_avg_reduction_pct", "не указано") != "не указано":
-        lines.append(f"Аналитика торгов (отчёт): снижение {appr['auction_avg_reduction_pct']}")
-    if appr.get("auction_participants_hint", "не указано") != "не указано":
-        lines.append(f"Заявок по аналитике отчёта: {appr['auction_participants_hint']}")
-    if appr.get("liquidation_price"):
-        lines.append(f"Ликвидационная стоимость (отчёт): {_fmt_money(appr['liquidation_price'])}")
+    ta = lot.get("trading_analytics") or {}
+    red = ta.get("avg_reduction_pct") or appr.get("auction_avg_reduction_pct", "не указано")
+    apps = ta.get("participants_hint") or appr.get("auction_participants_hint", "не указано")
+    if red != "не указано":
+        lines.append(f"Аналитика торгов: снижение на публичке {red}")
+    if apps != "не указано":
+        lines.append(f"Среднее заявок (аналитика): {apps}")
 
     return {"known": True, "lines": lines, "discount_pct": disc if price_lot > 0 else None, "market": market}
 
