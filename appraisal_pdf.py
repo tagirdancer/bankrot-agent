@@ -124,34 +124,238 @@ def _extract_cadastral_value(norm: str) -> int:
     return 0
 
 
+def _clean_html(text: str) -> str:
+    return re.sub(r"<[^>]+>", " ", text or "")
+
+
+def _lot_type_from_line(line: str) -> str:
+    ll = line.lower()
+    if "гараж" in ll or "машиномест" in ll:
+        return "гараж"
+    if re.search(r"зем\.?\s*уч|земельн[^\n]{0,20}участ|(?:^|\s)участок", ll):
+        return "земля"
+    if "квартира" in ll or re.search(r"\d[\s-]*комнат", ll):
+        if "нежил" not in ll:
+            return "квартира"
+    if "нежил" in ll or "помещен" in ll:
+        return "коммерция"
+    if "жилой дом" in ll or "домовлад" in ll:
+        return "дом"
+    return ""
+
+
+def _types_compatible(subject: str, candidate: str) -> bool:
+    """Тот же класс объекта для сравнения."""
+    if not candidate:
+        return False
+    s = subject if subject in ("квартира", "апартаменты", "дом", "коммерция", "земля", "гараж") else "прочее"
+    groups = {
+        "квартира": {"квартира", "апартаменты"},
+        "апартаменты": {"квартира", "апартаменты"},
+        "дом": {"дом"},
+        "коммерция": {"коммерция"},
+        "земля": {"земля"},
+        "гараж": {"гараж"},
+    }
+    allowed = groups.get(s, {s})
+    return candidate in allowed
+
+
+def _extract_trading_table_section(norm: str) -> str:
+    tl = norm.lower()
+    for marker in (
+        "состав объектов выставленных на торги",
+        "объект текущая цена",
+        "завершенные торги на карте",
+    ):
+        i = tl.find(marker)
+        if i >= 0:
+            return norm[i: i + 9000]
+    i = tl.find("аналитика торгов")
+    if i >= 0:
+        return norm[i: i + 9000]
+    return ""
+
+
+def _parse_trading_table_row(line: str) -> dict | None:
+    line = re.sub(r"\s+", " ", _clean_html(line)).strip()
+    if len(line) < 12:
+        return None
+    if line.lower().startswith(("объект ", "текущая цена", "тип ", "статус")):
+        return None
+    area_m = re.search(r"(\d+[.,]?\d*)\s*(?:м²|м2|кв\.?\s*м|кв\.м)", line, re.I)
+    if not area_m:
+        return None
+    try:
+        area = float(area_m.group(1).replace(",", "."))
+    except ValueError:
+        return None
+    if area < 5 or area > 500_000:
+        return None
+    prices: list[int] = []
+    for pm in re.finditer(r"(?<!\d)(\d[\d\s]{5,10})(?:[.,](\d{2}))?", line):
+        v = int(re.sub(r"\s", "", pm.group(1)))
+        if 100_000 <= v <= 500_000_000:
+            prices.append(v)
+    if not prices:
+        return None
+    price = max(prices)
+    obj_type = _lot_type_from_line(line)
+    ll = line.lower()
+    status = "не указано"
+    if "завершен" in ll:
+        status = "завершённые"
+    elif "открыт" in ll:
+        status = "открыт приём"
+    return {
+        "price": price,
+        "area_sqm": area,
+        "type": obj_type,
+        "status": status,
+        "raw": line[:140],
+    }
+
+
+def _parse_trading_table(norm: str) -> list[dict]:
+    section = _extract_trading_table_section(norm)
+    if not section:
+        return []
+    rows: list[dict] = []
+    seen: set[tuple] = set()
+    for line in section.split("\n"):
+        row = _parse_trading_table_row(line)
+        if not row:
+            continue
+        key = (row["price"], round(row["area_sqm"], 1), row["type"])
+        if key in seen:
+            continue
+        seen.add(key)
+        rows.append(row)
+    return rows
+
+
 def _extract_auction_analytics(norm: str) -> dict:
     out = {
         "avg_reduction_pct": "не указано",
         "participants_hint": "не указано",
         "raw_snippet": "",
     }
-    for pat in (
-        r"(?:аналитик[^\n]*торг)[^\n]{0,80}\n([\s\S]{30,1200}?)(?:\n\s*\d+\.\s|\nСудебн|\Z)",
-        r"(?:снижен[^\n]{0,60}на\s+торг)[^\n]{0,80}\n([\s\S]{30,800}?)(?:\n|\Z)",
-    ):
-        red = re.search(pat, norm, re.I)
-        if red:
-            chunk = red.group(0)[:600]
-            out["raw_snippet"] = chunk[:200]
-            rm = re.search(r"(?:средн[^\n]{0,30})?(\d+[.,]?\d*)\s*%", chunk, re.I)
-            if rm:
-                out["avg_reduction_pct"] = f"~{rm.group(1).replace(',', '.')}% (отчёт об оценке)"
-            pm = re.search(r"(\d+)\s*(?:заявок|участник|заявител)", chunk, re.I)
-            if pm:
-                out["participants_hint"] = pm.group(1)
-            break
+    chunk = norm
+    idx = norm.lower().find("аналитик")
+    if idx >= 0:
+        chunk = norm[idx: idx + 3500]
+    out["raw_snippet"] = chunk[:220]
+
+    rm = re.search(
+        r"Среднее\s+снижение\s+цены\s+на\s+публичном\s+предложении\s+(-?\d+[.,]\d+)\s*%",
+        norm,
+        re.I,
+    )
+    if rm:
+        out["avg_reduction_pct"] = f"{rm.group(1).replace(',', '.')}% (аналитика торгов)"
+
+    pm = re.search(
+        r"Среднее\s+количество\s+заявок\s+на\s+лот\s+(\d+[.,]\d+)",
+        norm,
+        re.I,
+    )
+    if pm:
+        out["participants_hint"] = pm.group(1).replace(",", ".")
     return out
+
+
+def parse_trading_analytics(text: str) -> dict:
+    """Аналитика торгов: таблица лотов + сводные метрики."""
+    result = {
+        "table_rows": [],
+        "avg_reduction_pct": "не указано",
+        "participants_hint": "не указано",
+        "parsed_ok": False,
+    }
+    if not text or len(text) < MIN_TEXT:
+        return result
+    norm = re.sub(r"[ \t]+", " ", _clean_html(text))
+    norm = re.sub(r"\n{3,}", "\n\n", norm)
+    if "аналитик" not in norm.lower() or "торг" not in norm.lower():
+        return result
+    result["table_rows"] = _parse_trading_table(norm)
+    stats = _extract_auction_analytics(norm)
+    result["avg_reduction_pct"] = stats["avg_reduction_pct"]
+    result["participants_hint"] = stats["participants_hint"]
+    result["parsed_ok"] = bool(result["table_rows"]) or stats["avg_reduction_pct"] != "не указано"
+    return result
+
+
+def compute_trading_market(lot_type: str, area_sqm: float, text: str) -> dict:
+    """
+    Рыночный ориентир из таблицы соседних лотов (аналитика торгов).
+    Медиана ₽/м² по аналогам того же типа и площади ±30%.
+    """
+    empty = {
+        "market_price": 0,
+        "median_ppm": 0,
+        "n_analogs": 0,
+        "analogs": [],
+        "coarse": False,
+        "comment": "рынок не определён",
+        "manual_market": True,
+        "market_source": "",
+    }
+    if not text or area_sqm <= 0:
+        return empty
+
+    ta = parse_trading_analytics(text)
+    rows = ta.get("table_rows") or []
+    if not rows:
+        return empty
+
+    lo, hi = area_sqm * 0.7, area_sqm * 1.3
+    analogs = [
+        r for r in rows
+        if _types_compatible(lot_type, r.get("type") or "")
+        and lo <= r["area_sqm"] <= hi
+    ]
+    open_only = [r for r in analogs if "заверш" not in (r.get("status") or "").lower()]
+    if open_only:
+        analogs = open_only
+    if not analogs:
+        return empty
+
+    tol = max(1.0, area_sqm * 0.02)
+    exact = [r for r in analogs if abs(r["area_sqm"] - area_sqm) <= tol]
+    if exact:
+        analogs = exact
+
+    ppms = [r["price"] / r["area_sqm"] for r in analogs]
+    med_ppm = statistics.median(ppms)
+    orientir = int(med_ppm * area_sqm)
+    coarse = len(analogs) < 3
+
+    if coarse and len(analogs) < 1:
+        return empty
+
+    comment = "по аналогичным лотам рядом (аналитика торгов)"
+    if coarse:
+        comment = f"мало аналогов ({len(analogs)}), ориентир грубый; {comment}"
+
+    return {
+        "market_price": orientir,
+        "median_ppm": int(med_ppm),
+        "n_analogs": len(analogs),
+        "analogs": analogs[:10],
+        "coarse": coarse,
+        "comment": comment,
+        "manual_market": False,
+        "market_source": "trading_analytics",
+        "trading_analytics": ta,
+        "market_disclaimer": "по аналогичным лотам рядом (аналитика торгов)",
+    }
 
 
 def resolve_market_orientir(parsed: dict, lot_cadastral_value: int = 0) -> dict:
     """
-    Единый рыночный ориентир из распознанного отчёта.
-    Приоритет: рыночная оценка отчёта → медиана объявлений → кадастровая стоимость.
+    Рыночный ориентир из распознанного отчёта.
+    Кадастровая стоимость НЕ используется как рынок.
     """
     out = {
         "price": 0,
@@ -161,6 +365,16 @@ def resolve_market_orientir(parsed: dict, lot_cadastral_value: int = 0) -> dict:
         "comparables_range": parsed.get("comparables_range", "не указано"),
         "comparables_median": parsed.get("comparables_median", 0),
     }
+    ta_orient = int(parsed.get("trading_market_price") or 0)
+    if ta_orient > 0:
+        out.update(
+            price=ta_orient,
+            source="trading_analytics",
+            label=f"медиана {parsed.get('trading_median_ppm', 0):,} ₽/м²".replace(",", " "),
+            disclaimer="по аналогичным лотам рядом (аналитика торгов)",
+        )
+        return out
+
     mp = int(parsed.get("market_price") or parsed.get("appraisal_price") or 0)
     if mp > 0:
         out.update(
@@ -168,26 +382,6 @@ def resolve_market_orientir(parsed: dict, lot_cadastral_value: int = 0) -> dict:
             source="appraisal_valuation",
             label="рыночная оценка отчёта",
             disclaimer="из отчёта об оценке",
-        )
-        return out
-
-    med = int(parsed.get("comparables_median") or 0)
-    if med > 0:
-        out.update(
-            price=med,
-            source="appraisal_comparables",
-            label=f"аналоги {parsed.get('comparables_range', '')}",
-            disclaimer="ориентир по объявлениям из отчёта, проверить",
-        )
-        return out
-
-    cv = int(parsed.get("cadastral_value") or lot_cadastral_value or 0)
-    if cv > 0:
-        out.update(
-            price=cv,
-            source="cadastral_coarse",
-            label="кадастровая стоимость",
-            disclaimer="грубо, по кадастру",
         )
         return out
     return out
@@ -257,6 +451,12 @@ def parse_appraisal_pdf(text: str) -> dict:
     result["auction_avg_reduction_pct"] = analytics["avg_reduction_pct"]
     result["auction_participants_hint"] = analytics["participants_hint"]
     result["auction_analytics_snippet"] = analytics["raw_snippet"]
+    ta = parse_trading_analytics(norm)
+    result["trading_table_rows"] = ta.get("table_rows") or []
+    if ta.get("avg_reduction_pct", "не указано") != "не указано":
+        result["auction_avg_reduction_pct"] = ta["avg_reduction_pct"]
+    if ta.get("participants_hint", "не указано") != "не указано":
+        result["auction_participants_hint"] = ta["participants_hint"]
 
     if re.search(r"судебн[^\n]{0,40}дел[^\n]{0,40}(?:не\s+обнаруж|отсутств)", tl):
         result["court_cases"] = "не обнаружены"
@@ -282,9 +482,8 @@ def parse_appraisal_pdf(text: str) -> dict:
 
     orient = resolve_market_orientir(result)
     best_price = orient.get("price") or 0
-    result["parsed_ok"] = best_price > 0 or any(
+    result["parsed_ok"] = best_price > 0 or bool(result["trading_table_rows"]) or any(
         x not in ("", "не указано") for x in (
-            result["comparables_range"],
             result["court_cases"],
             result["auction_avg_reduction_pct"],
             result["auction_participants_hint"],
@@ -297,20 +496,16 @@ def parse_appraisal_pdf(text: str) -> dict:
             f"{result.get('market_price_label') or 'рыночная'} "
             f"{result['market_price']/1e6:.2f} млн ₽"
         )
-    elif result["comparables_median"]:
-        parts.append(
-            f"аналоги (мед. {_fmt_mln(result['comparables_median'])}): {result['comparables_range']}"
-        )
     elif result["appraisal_price"]:
         parts.append(f"оценочная {result['appraisal_price']/1e6:.2f} млн ₽")
     if result["liquidation_price"]:
         parts.append(f"ликвидационная {result['liquidation_price']/1e6:.2f} млн ₽")
-    if result["cadastral_value"] and not result["market_price"]:
-        parts.append(f"кадастр {_fmt_mln(result['cadastral_value'])}")
-    if result["comparables_range"] != "не указано" and result["comparables_median"]:
-        parts.append(f"объявления: {result['comparables_range']}")
+    if result["trading_table_rows"]:
+        parts.append(f"лотов в аналитике: {len(result['trading_table_rows'])}")
     if result["auction_avg_reduction_pct"] != "не указано":
-        parts.append(f"снижение на торгах: {result['auction_avg_reduction_pct']}")
+        parts.append(f"снижение на публичке: {result['auction_avg_reduction_pct']}")
+    if result["auction_participants_hint"] != "не указано":
+        parts.append(f"заявок (сред.): {result['auction_participants_hint']}")
     if flags:
         parts.append("зоны: " + ", ".join(flags[:3]))
     result["summary"] = "; ".join(parts)[:400]
