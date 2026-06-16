@@ -506,6 +506,10 @@ async def _try_lot_pdfs(lot, page, ctx):
                     and "егрн" not in title.lower()
                 )
                 if is_appr:
+                    log.info(
+                        "appraisal step: downloaded bytes=%d title=%r",
+                        len(raw), title[:60],
+                    )
                     try:
                         text, method = extract_appraisal_pdf_text(raw)
                         log.info(
@@ -527,10 +531,18 @@ async def _try_lot_pdfs(lot, page, ctx):
                 entry["ext"] = "pdf"
                 if is_appr and len(text or "") < 80:
                     try:
-                        from egrn_pdf import ocr_available
-                        entry["ocr_available"] = ocr_available()
-                        if not entry["ocr_available"]:
-                            log.warning("appraisal OCR unavailable for %r", title[:60])
+                        from egrn_pdf import ocr_diagnostics
+                        diag = ocr_diagnostics()
+                        entry["ocr_diagnostics"] = {
+                            k: diag.get(k) for k in (
+                                "available", "reason", "tesseract",
+                                "tesseract_version", "pymupdf", "pymupdf_version",
+                            )
+                        }
+                        log.warning(
+                            "appraisal OCR weak: %d chars method=%s; diag=%s",
+                            len(text or ""), method, entry["ocr_diagnostics"],
+                        )
                     except ImportError:
                         entry["ocr_available"] = False
             elif raw[:4] == b"%PDF":
