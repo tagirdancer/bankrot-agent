@@ -52,6 +52,7 @@ REGIONS_EXTRA = ["sankt-peterburg","krasnodar","ekaterinburg","novosibirsk"]
 MAX_PAGES       = int(os.getenv("AGENT_MAX_PAGES", "12"))
 EXTRA_MAX_PAGES = int(os.getenv("AGENT_EXTRA_PAGES", "3"))
 TOP_N           = 15
+HEAVY_TOP_N     = int(os.getenv("AGENT_HEAVY_TOP", str(TOP_N)))
 
 # Бюджет прогона (сек): по умолчанию 55 мин — оставляем запас на отправку в TG
 RUN_BUDGET_SEC    = int(os.getenv("AGENT_BUDGET_SEC", "3300"))
@@ -60,7 +61,7 @@ LOT_TIMEOUT_LIGHT = int(os.getenv("LOT_TIMEOUT_LIGHT", "12"))
 LOT_TIMEOUT_HEAVY = int(os.getenv("LOT_TIMEOUT_HEAVY", "45"))
 MAX_HEAVY_LOTS    = int(os.getenv("AGENT_MAX_HEAVY", "45"))
 PDF_TIMEOUT       = int(os.getenv("PDF_TIMEOUT", "90"))
-HEAVY_MIN_SCORE   = float(os.getenv("AGENT_HEAVY_MIN_SCORE", str(max(MIN_SCORE, 6.5))))
+HEAVY_MIN_SCORE   = float(os.getenv("AGENT_HEAVY_MIN_SCORE", "0"))
 
 CATEGORIES = {
     "квартира":    {"icon":"🏠","label":"Квартиры",                 "default":True},
@@ -903,11 +904,41 @@ async def send_daily_digest(results, all_lots_count, alerts, skipped,
         v = results.get(cat_key, [])
         if not v:
             continue
-        v.sort(key=lambda x: float(x[1].get("total_score", 0)), reverse=True)
+        v.sort(
+            key=lambda x: (_discount_value(x[1]), float(x[1].get("total_score", 0) or 0)),
+            reverse=True,
+        )
         cat = CATEGORIES[cat_key]
         print(f"\n{cat['icon']} Отправляем {cat['label']}: {len(v)}")
         await send(build_msgs(cat_key, v))
         await asyncio.sleep(2)
+
+
+def _discount_value(an: dict) -> float:
+    try:
+        return float(an.get("discount_pct") or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _select_heavy_queue(scored: list) -> tuple[list, str]:
+    """Топ-N лёгкой фазы всегда идут в тяжёлую (для расчёта дисконта по документам)."""
+    if not scored:
+        return [], "нет лотов после лёгкой фазы (фильтр категории/регион)"
+    ranked = sorted(scored, key=lambda x: x[2], reverse=True)
+    cap = min(HEAVY_TOP_N, MAX_HEAVY_LOTS)
+    queue = ranked[:cap]
+    reason = f"гарантированный топ-{len(queue)} по баллу лёгкой фазы"
+    if HEAVY_MIN_SCORE > 0:
+        seen = {lot["id"] for lot, _, _, _ in queue}
+        extra = [
+            item for item in ranked[cap:]
+            if item[2] >= HEAVY_MIN_SCORE and item[0]["id"] not in seen
+        ]
+        if extra:
+            queue = (queue + extra)[:MAX_HEAVY_LOTS]
+            reason += f" + {len(queue) - cap} с баллом ≥{HEAVY_MIN_SCORE}"
+    return queue, reason
 
 
 def _build_results(scored, heavy_map):
@@ -945,7 +976,7 @@ async def run(cats=None, include_extra=True, daily=True, *,
     print(f"\n{'='*55}")
     print(f"🤖 Агент v10.0: {datetime.now().strftime('%d.%m.%Y %H:%M')} [{run_type}]")
     print(f"Категории: {', '.join(cats)} | Мин.балл: {min_result_score}")
-    print(f"Бюджет: {RUN_BUDGET_SEC}s | Тяжёлых лотов макс: {MAX_HEAVY_LOTS} | ≥{HEAVY_MIN_SCORE} балл")
+    print(f"Бюджет: {RUN_BUDGET_SEC}s | Тяжёлых: топ-{HEAVY_TOP_N} + до {MAX_HEAVY_LOTS} | дисконт ≥{MIN_DISCOUNT_PCT}%")
     if stream_chat_id:
         print(f"📡 Стриминг горячих ≥{stream_min_score} → chat {stream_chat_id}")
     print(f"{'='*55}\n")
@@ -990,18 +1021,14 @@ async def run(cats=None, include_extra=True, daily=True, *,
             alerts += 1
 
     async def _flush_if_needed(scored_list, reason=""):
-        nonlocal digest_sent, partial
-        if digest_sent or not daily or not _should_flush(start_ts):
+        nonlocal partial
+        if not daily or not _should_flush(start_ts):
             return False
         partial = True
-        res = _build_results(scored_list, heavy_map)
-        print(f"\n📤 Ранняя отправка дайджеста ({reason}), осталось {_budget_left(start_ts):.0f}с")
-        await send_daily_digest(
-            res, len(all_lots), alerts, skipped,
-            partial=True, stats=stats,
-            phase_note=f"\n_{reason}_",
+        print(
+            f"\n⏱ Лимит времени ({reason}), осталось {_budget_left(start_ts):.0f}с — "
+            f"останавливаем текущую фазу, тяжёлый анализ будет выполнен"
         )
-        digest_sent = True
         return True
 
     regions = list(REGIONS_MAIN)
@@ -1076,25 +1103,27 @@ async def run(cats=None, include_extra=True, daily=True, *,
 
         stats["light_sec"] = time.time() - light_t0
         avg_light = stats["light_sec"] / max(stats["light_n"], 1)
-        print(f"\n📊 Фаза 1: {stats['light_n']} лотов за {stats['light_sec']:.0f}с "
-              f"(~{avg_light:.1f}с/лот, таймаутов: {stats['light_timeouts']})")
+        print(f"\n📊 Лёгкая фаза: {stats['light_n']} лотов из {len(all_lots)} собранных "
+              f"({stats['light_sec']:.0f}с, ~{avg_light:.1f}с/лот, таймаутов: {stats['light_timeouts']})")
 
-        # Отбор топ-кандидатов для тяжёлого анализа
-        scored.sort(key=lambda x: x[2], reverse=True)
-        must_heavy = [(lot, an, score, cat) for lot, an, score, cat in scored if score >= 9.0]
-        must_ids = {lot["id"] for lot, _, _, _ in must_heavy}
-        rest_heavy = [
-            (lot, an, score, cat) for lot, an, score, cat in scored
-            if score >= HEAVY_MIN_SCORE and lot["id"] not in must_ids
-        ]
-        heavy_queue = (must_heavy + rest_heavy)[:MAX_HEAVY_LOTS]
-        print(f"🎯 В тяжёлый анализ: {len(heavy_queue)} лотов (балл ≥ {HEAVY_MIN_SCORE}, дисконт ≥{MIN_DISCOUNT_PCT}% после оценки)\n")
+        heavy_queue, sel_reason = _select_heavy_queue(scored)
+        print(f"🎯 Лёгкая → тяжёлая: отобрано {len(heavy_queue)} лотов ({sel_reason})")
+        if heavy_queue:
+            preview = ", ".join(
+                f"{lot['id']}:{score:.1f}" for lot, _, score, _ in heavy_queue[:8]
+            )
+            tail = "…" if len(heavy_queue) > 8 else ""
+            print(f"   кандидаты: {preview}{tail}")
+        elif scored:
+            best = max(scored, key=lambda x: x[2])
+            print(f"   ⚠️ очередь пуста при {len(scored)} лёгких; лучший балл: {best[2]:.1f}")
+        print()
 
         heavy_map = {}  # lot id -> (lot, an)
         heavy_t0 = time.time()
 
         # ── Фаза 2: тяжёлый проход ──
-        if heavy_queue and not digest_sent:
+        if heavy_queue:
             print("🔬 Фаза 2 — PDF ЕГРН + Groq для топ-кандидатов...")
             for j, (lot, light_an, score, cat) in enumerate(heavy_queue):
                 if await _flush_if_needed(scored, "лимит времени в фазе 2"):
@@ -1123,20 +1152,39 @@ async def run(cats=None, include_extra=True, daily=True, *,
                 await asyncio.sleep(0.2)
 
         stats["heavy_sec"] = time.time() - heavy_t0
+        if stats["heavy_n"]:
+            disc_ok = sum(
+                1 for _lot, an in heavy_map.values() if an.get("discount_ok")
+            )
+            mkt_known = sum(
+                1 for _lot, an in heavy_map.values() if an.get("market_known")
+            )
+            print(
+                f"\n📊 Тяжёлая фаза: {stats['heavy_n']} лотов за {stats['heavy_sec']:.0f}с | "
+                f"рынок определён: {mkt_known} | дисконт ≥{MIN_DISCOUNT_PCT}%: {disc_ok}"
+            )
+        else:
+            print(f"\n📊 Тяжёлая фаза: 0 лотов ({stats['heavy_sec']:.0f}с)")
 
         results = _build_results(scored, heavy_map)
+        heavy_ids = set(heavy_map.keys())
         if hot_only or min_result_score > MIN_SCORE:
             for cat_key in list(results.keys()):
                 results[cat_key] = [
                     (lot, an) for lot, an in results[cat_key]
                     if float(an.get("total_score", 0) or 0) >= min_result_score
                 ]
-        # Отсев: только реальный дисконт ≥ MIN_DISCOUNT_PCT
+        # Дайджест: лоты с подтверждённым дисконтом; если тяжёлый анализ был — любой >0%
         for cat_key in list(results.keys()):
             results[cat_key] = [
                 (lot, an) for lot, an in results[cat_key]
                 if an.get("discount_ok")
+                or (lot["id"] in heavy_ids and _discount_value(an) > 0)
             ]
+            results[cat_key].sort(
+                key=lambda x: (_discount_value(x[1]), float(x[1].get("total_score", 0) or 0)),
+                reverse=True,
+            )
 
         await browser.close()
 
