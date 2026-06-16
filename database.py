@@ -154,6 +154,13 @@ def mark_reminded(lot_id: str, chat_id: str):
     conn.close()
 
 
+def _discount_from_an(an: dict) -> float:
+    try:
+        return float(an.get("discount_pct") or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
 def _an_for_store(an: dict) -> dict:
     skip = {"extra_checks", "verdict_card"}
     return {k: v for k, v in an.items() if k not in skip and isinstance(v, (str, int, float, bool, type(None), list, dict))}
@@ -172,7 +179,13 @@ def save_agent_run(started_at: str, run_type: str, categories, results: dict,
                 "an": _an_for_store(an),
                 "score": float(an.get("total_score", 0) or 0),
             })
-    flat.sort(key=lambda x: x["score"], reverse=True)
+    flat.sort(
+        key=lambda x: (
+            _discount_from_an(x["an"]),
+            x["score"],
+        ),
+        reverse=True,
+    )
     flat = flat[:60]
     conn = get_conn()
     cur = conn.execute("""
