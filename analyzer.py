@@ -350,6 +350,7 @@ def parse_egrn_pdf(text: str) -> dict:
         "cadastral": "", "address": "", "area": "",
         "owner": "", "encumbrances": "", "share": "", "arrests": "",
         "encumbrances_clean": False,
+        "cadastral_value": 0,
         "summary": "", "parsed_ok": False,
     }
     if not text or len(text) < 80:
@@ -423,6 +424,18 @@ def parse_egrn_pdf(text: str) -> dict:
     if re.search(r"\barrest\b|арест\s|наложен\s+арест|запрещени[ея]\s+регистрац", norm, re.I):
         am = re.search(r"(арест[^\n]{5,120}|запрещени[ея][^\n]{5,120})", norm, re.I)
         result["arrests"] = (am.group(1).strip()[:120] if am else "упоминается в тексте ЕГРН")
+
+    cv_m = re.search(
+        r"кадастров[\s\S]{0,70}?стоим[^\d]{0,25}(\d[\d\s]{5,11})",
+        norm, re.I,
+    )
+    if cv_m:
+        try:
+            cv = int(re.sub(r"\s", "", cv_m.group(1)))
+            if 50_000 <= cv <= 2_000_000_000:
+                result["cadastral_value"] = cv
+        except ValueError:
+            pass
 
     parts = []
     if result["cadastral"]:
@@ -747,6 +760,67 @@ def enrich_what_to_check(wtc: str, cadastral: str, address: str = "",
     return f"{wtc}\n{extra}" if wtc else extra
 
 
+def _cadastral_value_from_lot(lot: dict) -> int:
+    """Кадастровая стоимость из ЕГРН или текста отчёта."""
+    try:
+        from appraisal_pdf import _extract_cadastral_value
+    except ImportError:
+        _extract_cadastral_value = None  # type: ignore[assignment]
+    for blob in (lot.get("appraisal_pdf_text"), lot.get("egrn_pdf_text")):
+        if blob and len(blob) > 100 and _extract_cadastral_value:
+            v = _extract_cadastral_value(blob)
+            if v:
+                return v
+    for rec in dedupe_egrn_records(lot.get("egrn_records") or []):
+        cv = int(rec.get("cadastral_value") or 0)
+        if cv > 0:
+            return cv
+    return 0
+
+
+def _resolve_market_from_documents(lot: dict, area_sqm: float) -> dict:
+    """Рыночный ориентир только из документов лота (отчёт → объявления → кадастр)."""
+    appr = lot.get("appraisal_parsed") or {}
+    lot_cv = _cadastral_value_from_lot(lot)
+    orient: dict = {"price": 0, "source": "", "disclaimer": ""}
+    try:
+        from appraisal_pdf import resolve_market_orientir
+        orient = resolve_market_orientir(appr, lot_cv)
+    except ImportError:
+        pass
+
+    price = int(orient.get("price") or 0)
+    if price <= 0:
+        return {
+            "market_price": 0,
+            "rental_monthly": 0,
+            "price_per_sqm": 0,
+            "area": area_sqm,
+            "comment": "рынок не определён",
+            "manual_market": True,
+            "market_source": "",
+        }
+
+    src = orient.get("source") or "appraisal"
+    comment = orient.get("disclaimer") or "ориентир из отчёта"
+    cr = orient.get("comparables_range") or appr.get("comparables_range", "")
+    if cr and cr != "не указано" and src == "appraisal_comparables":
+        comment = f"аналоги {cr}; {orient.get('disclaimer', '')}"
+
+    return {
+        "market_price": price,
+        "rental_monthly": 0,
+        "price_per_sqm": int(price / area_sqm) if area_sqm else 0,
+        "area": area_sqm,
+        "comment": comment[:200],
+        "manual_market": False,
+        "market_source": src,
+        "comparables_range": cr,
+        "comparables_median": orient.get("comparables_median") or appr.get("comparables_median", 0),
+        "market_disclaimer": orient.get("disclaimer", ""),
+    }
+
+
 def format_price_line(an: dict) -> str:
     """Строка цены — без ложного дисконта при неизвестном рынке."""
     price = an.get("price", "—")
@@ -758,12 +832,22 @@ def format_price_line(an: dict) -> str:
             return f"💰 {price} | _оценить рынок земли вручную_"
         return f"💰 {price} | _рынок не определён — оценить вручную_"
     disc = an.get("discount_pct", "0")
-    disc_s = f" (-{disc}%)" if str(disc) not in ("0", "?", "") else ""
-    if an.get("market_source") == "appraisal":
-        return f"💰 {price} → оценка {an.get('market_price', '—')}{disc_s} _из отчёта_"
-    if an.get("market_source") == "search":
-        return f"💰 {price} → ориентир {an.get('market_price', '—')}{disc_s} _проверить_"
-    return f"💰 {price} → рынок {an.get('market_price', '—')}{disc_s}"
+    disc_s = f", дисконт ~{disc}%" if str(disc) not in ("0", "?", "") else ""
+    src = an.get("market_source", "")
+    mkt = an.get("market_price", "—")
+    if src == "appraisal_comparables":
+        cr = an.get("comparables_range") or "—"
+        return (
+            f"💰 цена лота {price}, аналоги рядом {cr} (мед. {mkt}){disc_s} "
+            f"_ориентир по объявлениям из отчёта, проверить_"
+        )
+    if src == "cadastral_coarse":
+        return f"💰 {price} → ~{mkt} (кадастр){disc_s} _грубо, по кадастру_"
+    if src in ("appraisal", "appraisal_valuation"):
+        return f"💰 {price} → оценка {mkt}{disc_s} _из отчёта_"
+    if src == "search":
+        return f"💰 {price} → ориентир {mkt}{disc_s} _проверить_"
+    return f"💰 {price} → рынок {mkt}{disc_s}"
 
 
 def detect_type(text: str) -> str:
@@ -1371,26 +1455,8 @@ async def analyze_lot(lot: dict, light: bool = False) -> dict:
                 except ValueError:
                     area_sqm = 0
         appr = lot.get("appraisal_parsed") or {}
-        appr_price = (
-            appr.get("market_price")
-            or appr.get("appraisal_price")
-            or appr.get("liquidation_price")
-            or 0
-        )
-        if appr_price and appr_price > 0:
-            comment = appr.get("summary") or "ориентир из отчёта об оценке"
-            if appr.get("comparables_range", "не указано") != "не указано":
-                comment += f"; аналоги: {appr['comparables_range']}"
-            mkt = {
-                "market_price": appr_price,
-                "rental_monthly": 0,
-                "price_per_sqm": int(appr_price / area_sqm) if area_sqm else 0,
-                "area": area_sqm,
-                "comment": comment,
-                "manual_market": False,
-                "market_source": "appraisal",
-            }
-        else:
+        mkt = _resolve_market_from_documents(lot, area_sqm)
+        if mkt.get("market_price", 0) <= 0:
             orient = {"found": False, "comment": "рынок не определён"}
             try:
                 from market_search import fetch_market_orientir
@@ -1409,7 +1475,7 @@ async def analyze_lot(lot: dict, light: bool = False) -> dict:
                     "manual_market": False,
                     "market_source": "search",
                 }
-            else:
+            elif not mkt.get("comment"):
                 mkt = {
                     "market_price": 0, "rental_monthly": 0, "price_per_sqm": 0,
                     "area": area_sqm,
@@ -1616,6 +1682,8 @@ async def analyze_lot(lot: dict, light: bool = False) -> dict:
         "market_source": mkt.get("market_source", ""),
         "discount_pct": str(disc_pct) if market_known and disc_pct > 0 else "?",
         "lot_type": lot_type,
+        "comparables_range": mkt.get("comparables_range", ""),
+        "market_disclaimer": mkt.get("market_disclaimer", ""),
     }
     discount_ok = market_known and disc_pct >= MIN_DISCOUNT_PCT
 
@@ -1628,6 +1696,8 @@ async def analyze_lot(lot: dict, light: bool = False) -> dict:
         "market_known":   market_known,
         "market_source":  mkt.get("market_source", ""),
         "market_comment": mkt.get("comment", ""),
+        "comparables_range": mkt.get("comparables_range", ""),
+        "market_disclaimer": mkt.get("market_disclaimer", ""),
         "discount_pct":   an_stub["discount_pct"],
         "discount_ok":    discount_ok,
         "qualifies_hot":  discount_ok and score >= 7.0,
