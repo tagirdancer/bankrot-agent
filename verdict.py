@@ -45,10 +45,12 @@ def _egrn_object_line(rec: dict, idx: int) -> dict:
     cad = rec.get("cadastral") or "не указано"
     source = rec.get("source_title") or rec.get("source") or f"ЕГРН #{idx}"
     enc = rec.get("encumbrances") or "не указано в тексте"
-    if rec.get("encumbrances_clean"):
-        enc_display = enc
-    else:
-        enc_display = enc
+    try:
+        from analyzer import _clean_field_text
+        enc = _clean_field_text(enc, 100)
+    except Exception:
+        enc = str(enc)[:100]
+    enc_display = enc
 
     return {
         "label": label,
@@ -179,10 +181,12 @@ def _documents_coverage(lot: dict) -> dict[str, str]:
 
 def extract_document_facts(lot: dict, an: dict) -> dict[str, Any]:
     """Факты строго из прочитанных документов и полей парсера."""
-    egrn_records = list(lot.get("egrn_records") or [])
+    from analyzer import dedupe_egrn_records
+
+    egrn_records = dedupe_egrn_records(list(lot.get("egrn_records") or []))
     egrn_parsed = lot.get("egrn_parsed") or {}
     if not egrn_records and egrn_parsed.get("objects"):
-        egrn_records = list(egrn_parsed["objects"])
+        egrn_records = dedupe_egrn_records(list(egrn_parsed["objects"]))
 
     egrn_objects: list[dict] = []
     for i, rec in enumerate(egrn_records, 1):
@@ -254,7 +258,7 @@ def build_verdict_sections(facts: dict) -> dict[str, Any]:
 
     # --- Известное из документов ---
     if facts["egrn_count"]:
-        known_lines.append(f"ЕГРН: {facts['egrn_count']} выписк(и/а) распознана(ы)")
+        known_lines.append(f"ЕГРН: {facts['egrn_count']} объект(а/ов) в выписках")
         for i, obj in enumerate(facts["egrn_objects"], 1):
             line = (
                 f"  • Объект {i} ({obj['label']}), кад. {obj['cadastral']}: "
@@ -307,9 +311,14 @@ def build_verdict_sections(facts: dict) -> dict[str, Any]:
         known_lines.append("Фото объекта: есть на сайте")
 
     # --- Плюсы ---
+    seen_plus: set[str] = set()
     for obj in facts["egrn_encumbrance_clean"]:
+        key = obj.get("cadastral") or obj.get("label") or ""
+        if key in seen_plus:
+            continue
+        seen_plus.add(key)
         pluses.append(
-            f"ЕГРН «{obj['source'][:45]}» (кад. {obj['cadastral']}): {obj['encumbrances']}"
+            f"ЕГРН «{obj['source'][:45]}» (кад. {obj['cadastral']}): {obj['encumbrances'][:80]}"
         )
     if facts["egrn_count"] >= 2:
         pluses.append(f"Комплект выписок: {facts['egrn_count']} объекта")
@@ -325,12 +334,22 @@ def build_verdict_sections(facts: dict) -> dict[str, Any]:
         pluses.append("Есть фото объекта")
 
     # --- Минусы / внимание ---
+    seen_minus: set[str] = set()
     for obj in facts["egrn_encumbrance_issues"]:
+        key = obj.get("cadastral") or obj.get("label") or ""
+        if key in seen_minus:
+            continue
+        seen_minus.add(key)
         minuses.append(
-            f"ЕГРН «{obj['source'][:45]}» (кад. {obj['cadastral']}): {obj['encumbrances']}"
+            f"ЕГРН «{obj['source'][:45]}» (кад. {obj['cadastral']}): {obj['encumbrances'][:80]}"
         )
+    seen_arrest: set[str] = set()
     for obj in facts["egrn_objects"]:
+        key = obj.get("cadastral") or obj.get("label") or ""
+        if key in seen_arrest:
+            continue
         if obj["arrests"] and obj["arrests"] != "не указано":
+            seen_arrest.add(key)
             minuses.append(
                 f"ЕГРН «{obj['source'][:40]}»: аресты — {obj['arrests'][:90]}"
             )
@@ -382,7 +401,8 @@ def _calc_risk_level(facts: dict, cov: dict) -> str:
     if not facts["egrn_has_data"]:
         risk_score += 3
     if facts["egrn_encumbrance_issues"]:
-        risk_score += 2 * len(facts["egrn_encumbrance_issues"])
+        n_enc = len({o.get("cadastral") or o.get("label") for o in facts["egrn_encumbrance_issues"]})
+        risk_score += 2 * n_enc
     if any("арест" in (o.get("arrests") or "").lower() for o in facts["egrn_objects"]):
         risk_score += 2
     if not (facts.get("market_comparison") or {}).get("known"):
@@ -402,7 +422,12 @@ def _risk_reasons(facts: dict, cov: dict) -> list[str]:
     reasons: list[str] = []
     if not facts["egrn_has_data"]:
         reasons.append("нет проверенной выписки ЕГРН")
+    seen: set[str] = set()
     for obj in facts["egrn_encumbrance_issues"]:
+        key = obj.get("cadastral") or obj.get("label") or ""
+        if key in seen:
+            continue
+        seen.add(key)
         reasons.append(f"{obj['label']} (кад. {obj['cadastral']}): {obj['encumbrances'][:60]}")
     if any("арест" in (o.get("arrests") or "").lower() for o in facts["egrn_objects"]):
         reasons.append("упоминание арестов в выписке")
@@ -430,13 +455,15 @@ def _unified_assessment(facts: dict, risk_level: str) -> tuple[int, str]:
         base -= 8
         logic.append("рынок не определён — ценовая привлекательность не оценивается")
     if facts["egrn_encumbrance_issues"]:
-        base -= 6 * min(len(facts["egrn_encumbrance_issues"]), 3)
-        logic.append(
-            f"обременения в {len(facts['egrn_encumbrance_issues'])} выписках снижают балл"
-        )
+        n_enc = len({o.get("cadastral") or o.get("label") for o in facts["egrn_encumbrance_issues"]})
+        base -= 6 * min(n_enc, 3)
+        if n_enc == 1:
+            logic.append("обременения в выписке снижают балл")
+        else:
+            logic.append(f"обременения в {n_enc} объектах снижают балл")
     if facts["egrn_count"] >= 2:
         base += 4
-        logic.append(f"прочитано {facts['egrn_count']} выписок ЕГРН")
+        logic.append(f"прочитано {facts['egrn_count']} объектов ЕГРН")
     return max(0, min(100, base)), "; ".join(logic)
 
 
