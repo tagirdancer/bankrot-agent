@@ -139,10 +139,14 @@ def _build_trading_section(lot: dict, appr: dict) -> list[str]:
     if parts is not None:
         lines.append(f"Заявок на момент карточки: {parts}")
 
-    if appr.get("auction_avg_reduction_pct", "не указано") != "не указано":
-        lines.append(f"Среднее снижение (отчёт, аналитика торгов): {appr['auction_avg_reduction_pct']}")
-    if appr.get("auction_participants_hint", "не указано") != "не указано":
-        lines.append(f"Заявок по аналитике отчёта: {appr['auction_participants_hint']}")
+    ta = lot.get("trading_analytics") or {}
+    red = ta.get("avg_reduction_pct") or appr.get("auction_avg_reduction_pct", "не указано")
+    apps = ta.get("participants_hint") or appr.get("auction_participants_hint", "не указано")
+    if red != "не указано":
+        val = str(red).replace(" (аналитика торгов)", "").replace("(аналитика торгов)", "")
+        lines.append(f"Среднее снижение на публичке: {val}")
+    if apps != "не указано":
+        lines.append(f"Среднее заявок на лот: {apps}")
 
     return lines
 
