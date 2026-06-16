@@ -423,18 +423,18 @@ async def deep_analysis(lot_id: str, facts: dict = None) -> str:
             k: v for k, v in (facts_json or {}).items()
             if not str(k).startswith("_")
         }
-        json_block = json.dumps(clean_facts, ensure_ascii=False, indent=2, default=str)
-        if len(json_block) > 2500:
-            json_block = json_block[:2500] + "\n… (обрезано)"
+        log.debug(
+            "deep_analysis facts lot=%s: %s",
+            lot_id,
+            json.dumps(clean_facts, ensure_ascii=False, default=str)[:4000],
+        )
     except Exception:
-        log.exception("deep_analysis json dump failed lot=%s", lot_id)
-        json_block = "{}"
+        log.exception("deep_analysis facts log failed lot=%s", lot_id)
 
     parts = []
     if parsed_hdr:
         parts.append(f"📅 Данные спарсены: {parsed_hdr}\n")
     parts.append(card or "Вердикт не сформирован — данных недостаточно.")
-    parts.append(f"\n*Извлечённые факты (шаг 1):*\n```\n{json_block}\n```")
     parts.append(f"\n*Ссылки для ручной проверки:*\n{verify_links}")
     return "\n".join(parts)
 
