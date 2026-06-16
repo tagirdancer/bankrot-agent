@@ -57,7 +57,25 @@ def reply_keyboard() -> ReplyKeyboardMarkup:
         ],
         resize_keyboard=True,
         one_time_keyboard=False,
+        is_persistent=True,
     )
+
+
+def _user_region_code(chat_id) -> str:
+    return user_region.get(str(chat_id), "moskva")
+
+
+def _user_region_name(chat_id) -> str:
+    code = _user_region_code(chat_id)
+    return next((k for k, v in REGIONS.items() if v == code), code)
+
+
+def _region_filter_for_agent(chat_id):
+    """None = все регионы агента; иначе список slug для collect()."""
+    code = _user_region_code(chat_id)
+    if code == "all":
+        return None
+    return [code]
 
 
 def run_category_menu():
@@ -151,7 +169,7 @@ async def cmd_latest(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await show_latest(update)
 
 
-async def _run_agent_background(chat_id: str, cats, hot_only: bool, bot, label: str):
+async def _run_agent_background(chat_id: str, cats, hot_only: bool, bot, label: str, region_filter=None):
     from agent import run as agent_run
     stream_min = 9.0 if hot_only else 8.0
     try:
@@ -166,6 +184,7 @@ async def _run_agent_background(chat_id: str, cats, hot_only: bool, bot, label: 
                 stream_bot=bot,
                 stream_min_score=stream_min,
                 hot_only=hot_only,
+                region_filter=region_filter,
             )
         await bot.send_message(
             chat_id=chat_id,
@@ -195,8 +214,8 @@ def _cats_for_run(cat: str):
 
 async def _launch_agent_run(chat_id: str, cat: str, bot):
     """Запуск прогона — общая логика для inline и reply-кнопок."""
-    region = user_region.get(str(chat_id), "moskva")
-    region_name = next((k for k, v in REGIONS.items() if v == region), region)
+    region_name = _user_region_name(chat_id)
+    region_filter = _region_filter_for_agent(chat_id)
     cat_names = {
         "full": "все категории", "квартира": "квартиры", "коммерция": "коммерция",
         "дом": "дома", "земля": "земля", "авто": "авто", "hot": "горячие 9+",
@@ -230,7 +249,9 @@ async def _launch_agent_run(chat_id: str, cat: str, bot):
         parse_mode="Markdown",
         reply_markup=reply_keyboard(),
     )
-    asyncio.create_task(_run_agent_background(str(chat_id), cats, hot_only, bot, label))
+    asyncio.create_task(
+        _run_agent_background(str(chat_id), cats, hot_only, bot, label, region_filter)
+    )
 
 
 async def scheduled_agent_job(ctx: ContextTypes.DEFAULT_TYPE):
@@ -465,7 +486,14 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("📱 Меню:", reply_markup=main_menu())
+    await update.message.reply_text(
+        "📱 Меню:",
+        reply_markup=main_menu(),
+    )
+    await update.message.reply_text(
+        "⌨️ Быстрые кнопки внизу — всегда под полем ввода.",
+        reply_markup=reply_keyboard(),
+    )
 
 
 async def cmd_saved(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -658,10 +686,8 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        region_name = next(
-            (k for k, v in REGIONS.items() if v == user_region.get(chat, "moskva")),
-            user_region.get(chat, "moskva"),
-        )
+        region_name = _user_region_name(chat)
+        region_filter = _region_filter_for_agent(chat)
         cat_names = {
             "full": "все категории", "квартира": "квартиры", "коммерция": "коммерция",
             "дом": "дома", "земля": "земля", "авто": "авто", "hot": "горячие 9+",
@@ -681,7 +707,9 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             ]]),
         )
         cats, hot_only = _cats_for_run(cat)
-        asyncio.create_task(_run_agent_background(chat, cats, hot_only, ctx.bot, label))
+        asyncio.create_task(
+            _run_agent_background(chat, cats, hot_only, ctx.bot, label, region_filter)
+        )
 
 async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     text = (update.message.text or "").strip()
@@ -694,8 +722,7 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         elif text == REPLY_HOT:
             await _launch_agent_run(update.effective_chat.id, "hot", ctx.bot)
         elif text == REPLY_RUN:
-            region = user_region.get(str(update.effective_chat.id), "moskva")
-            region_name = next((k for k, v in REGIONS.items() if v == region), region)
+            region_name = _user_region_name(update.effective_chat.id)
             await update.message.reply_text(
                 f"🚀 *Запустить анализ*\n\nРегион: *{region_name}*\n\nВыберите категорию:",
                 parse_mode="Markdown",
@@ -707,7 +734,10 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if lot_id:
         from analyzer import format_short_lot_message, lot_action_keyboard
         from telegram.error import BadRequest
-        msg = await update.message.reply_text("⏳ Парсю и анализирую лот (~1 мин)...")
+        msg = await update.message.reply_text(
+            "⏳ Парсю и анализирую лот (~1 мин)...",
+            reply_markup=reply_keyboard(),
+        )
         try:
             lot, an, parsed_at = await fetch_and_analyze_lot(lot_id)
         except Exception as exc:
@@ -756,7 +786,7 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     if len(text) > 3:
-        msg = await update.message.reply_text("💭 Думаю...")
+        msg = await update.message.reply_text("💭 Думаю...", reply_markup=reply_keyboard())
         answer = await ask_expert(text)
         await msg.edit_text(answer)
 
