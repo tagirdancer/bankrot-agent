@@ -927,7 +927,7 @@ async def run(cats=None, include_extra=True, daily=True, *,
               save_to_db=None, run_type="scheduled",
               stream_chat_id=None, stream_bot=None,
               stream_min_score=9.0, min_result_score=None,
-              hot_only=False):
+              hot_only=False, region_filter=None):
     init_db()
     if save_to_db is None:
         save_to_db = os.getenv("AGENT_SAVE_DB", "1") != "0"
@@ -1019,8 +1019,15 @@ async def run(cats=None, include_extra=True, daily=True, *,
 
         print("\n📡 Собираем лоты...")
         t0 = time.time()
-        main_lots = await collect(page, REGIONS_MAIN, MAX_PAGES)
-        extra_lots = await collect(page, REGIONS_EXTRA, EXTRA_MAX_PAGES) if include_extra else []
+        if region_filter:
+            if isinstance(region_filter, str):
+                region_filter = [region_filter]
+            main_lots = await collect(page, region_filter, MAX_PAGES)
+            extra_lots = []
+            print(f"   регион: {', '.join(region_filter)}")
+        else:
+            main_lots = await collect(page, REGIONS_MAIN, MAX_PAGES)
+            extra_lots = await collect(page, REGIONS_EXTRA, EXTRA_MAX_PAGES) if include_extra else []
         all_lots = main_lots + extra_lots
         stats["collect_sec"] = time.time() - t0
         print(f"✅ Собрано: {len(all_lots)} лотов за {stats['collect_sec']:.0f}с")
