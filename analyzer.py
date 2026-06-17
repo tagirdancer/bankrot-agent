@@ -25,6 +25,57 @@ HOT_LABEL_PCT = float(os.getenv("HOT_LABEL_PCT", "10"))  # пометка 🔥, 
 DIGEST_TOP_N = int(os.getenv("DIGEST_TOP_N", "10"))
 
 DIGEST_FORMULA = "45%×дисконт + 35%×низкая конкуренция + 20%×чистые документы"
+TG_MSG_LIMIT = 4096
+TG_CALLBACK_LIMIT = 64
+
+_URL_ENC_RE = re.compile(r"%[0-9A-Fa-f]{2}")
+_LONG_URL_RE = re.compile(r"https?://\S{80,}")
+
+
+def _clean_visible_text(text: str, max_len: int = 300) -> str:
+    """Убирает сырой URL-код и лишние пробелы из текста карточки."""
+    s = re.sub(r"\s+", " ", str(text or "")).strip()
+    if _URL_ENC_RE.search(s):
+        s = re.sub(r"\S*%[0-9A-Fa-f]{2}(?:%[0-9A-Fa-f]{2})+\S*", "", s)
+        s = re.sub(r"\s+", " ", s).strip()
+    s = _LONG_URL_RE.sub("[ссылка]", s)
+    return s[:max_len]
+
+
+def _tg_escape_md(text: str) -> str:
+    """Экранирование для Telegram legacy Markdown."""
+    s = str(text or "")
+    for ch in ("\\", "_", "*", "`", "["):
+        s = s.replace(ch, "\\" + ch)
+    return s
+
+
+def _strip_md_markers(text: str) -> str:
+    s = re.sub(r"_([^_]+)_", r"\1", str(text or ""))
+    return s.replace("*", "")
+
+
+def clamp_telegram_message(text: str, limit: int = TG_MSG_LIMIT) -> str:
+    if len(text) <= limit:
+        return text
+    return text[: limit - 20].rstrip() + "\n\n… _(обрезано)_"
+
+
+def format_short_lot_message_plain(lot: dict, an: dict, label: str = "ЛОТ") -> str:
+    md = format_short_lot_message(lot, an, label)
+    return clamp_telegram_message(_strip_md_markers(md.replace("\\", "")))
+
+
+def format_minimal_lot_card(lot: dict, an: dict, label: str = "ЛОТ") -> str:
+    lot_id = lot.get("id", "?")
+    disc = an.get("discount_pct", "?")
+    url = lot.get("url") or f"https://tbankrot.ru/item?id={lot_id}"
+    return clamp_telegram_message(
+        f"{label} — лот {lot_id}\n"
+        f"{_clean_visible_text(lot.get('title', ''), 80)}\n"
+        f"Дисконт: {disc}% | рейтинг: {an.get('digest_rating', '—')}\n"
+        f"{url}"
+    )
 
 REGION_LABELS = {
     "moskva": "Москва", "moskovskaya-oblast": "Московская область",
@@ -291,16 +342,22 @@ def enrich_digest_metrics(lot: dict, an: dict) -> dict:
 def format_short_lot_message(lot: dict, an: dict, label: str = "ЛОТ") -> str:
     """Короткая карточка: балл, цена, дисконт, конкуренция, обременения, ссылка."""
     score = an.get("total_score", "?")
-    verdict = an.get("verdict_label") or an.get("verdict_simple") or an.get("action", "?")
-    rn = f" 🌍 {lot.get('region', '')}" if lot.get("is_extra") else ""
+    verdict = _clean_visible_text(
+        an.get("verdict_label") or an.get("verdict_simple") or an.get("action", "?"), 120,
+    )
+    title = _clean_visible_text(lot.get("title", ""), 70)
+    rn = f" 🌍 {_clean_visible_text(lot.get('region', ''), 30)}" if lot.get("is_extra") else ""
     hot = "🔥 " if an.get("hot_label") else ""
+    label_safe = _clean_visible_text(label, 40)
     lines = [
-        f"🔔 *{hot}{label} — {score}/10*{rn}",
-        f"{lot.get('title', '')[:70]}",
+        f"🔔 *{hot}{_tg_escape_md(label_safe)} — {score}/10*{rn}",
+        _tg_escape_md(title),
     ]
     if an.get("dedup_note"):
-        lines.append(f"_{an['dedup_note']}_")
-    lines.append(an.get("price_line") or format_price_line(an))
+        lines.append(f"_{_tg_escape_md(_clean_visible_text(an['dedup_note'], 120))}_")
+    pl = an.get("price_line") or format_price_line(an)
+    pl = _clean_visible_text(_strip_md_markers(pl), 420)
+    lines.append(_tg_escape_md(pl))
 
     disc = an.get("discount_pct", "?")
     disc_s = f"{disc}%" if str(disc) not in ("?", "", "0") else "не определён"
@@ -318,43 +375,53 @@ def format_short_lot_message(lot: dict, an: dict, label: str = "ЛОТ") -> str:
     lines.append(f"📉 Дисконт: *{disc_s}* · 👥 заявок: *{parts_d}* ({comp})")
     enc_line = f"📄 Обременения: *{doc_l}*"
     if doc_l == "есть" and an.get("encumbrances"):
-        enc_line += f" — {an['encumbrances'][:70]}"
+        enc_line += f" — {_tg_escape_md(_clean_visible_text(an['encumbrances'], 70))}"
     lines.append(enc_line)
     dr = an.get("digest_rating")
     if dr is not None:
         lines.append(f"⭐ Рейтинг: *{dr}/100*")
 
     if an.get("lot_type") == "авто" and an.get("auto_summary"):
-        lines.append(f"🚗 {an['auto_summary'][:100]}")
+        lines.append(f"🚗 {_tg_escape_md(_clean_visible_text(an['auto_summary'], 100))}")
     lines += [
-        f"{an.get('action_emoji', '📋')} *{verdict}*",
-        f"🔗 {lot.get('url', '')}",
+        f"{an.get('action_emoji', '📋')} *{_tg_escape_md(verdict)}*",
+        f"🔗 {_clean_visible_text(lot.get('url', ''), 200)}",
     ]
-    return "\n".join(lines)
+    return clamp_telegram_message("\n".join(lines))
 
 
 def deep_callback_data(lot_id: str, an: dict, lot: dict, parsed_at=None) -> str:
-    """callback_data кнопки «Полный анализ» с реальными цифрами + timestamp спарсинга."""
+    """callback_data кнопки «Полный анализ» (≤64 байт для Telegram)."""
     if parsed_at is None:
         ts = int(time.time())
     elif isinstance(parsed_at, datetime):
         ts = int(parsed_at.timestamp())
     else:
         ts = int(parsed_at)
-    return (
+    disc = str(an.get("discount_pct", "0") or "0").replace(".", "")[:6]
+    full = (
         f"deep_{lot_id}_{int(an.get('lot_price_raw', 0) or 0)}_"
-        f"{int(an.get('market_price_raw', 0) or 0)}_{an.get('discount_pct', '0')}_"
+        f"{int(an.get('market_price_raw', 0) or 0)}_{disc}_"
         f"{lot.get('participants', 0)}_{ts}"
     )
+    if len(full.encode("utf-8")) <= TG_CALLBACK_LIMIT:
+        return full
+    short = f"deep_{lot_id}_{ts}"
+    if len(short.encode("utf-8")) <= TG_CALLBACK_LIMIT:
+        return short
+    return f"deep_{lot_id}"[:TG_CALLBACK_LIMIT]
 
 
 def lot_action_keyboard(lot_id: str, an: dict, lot: dict, parsed_at=None):
     """Кнопки под лотом: Полный анализ + Сохранить."""
     from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+    cb = deep_callback_data(lot_id, an, lot, parsed_at)
+    save_cb = f"save_{lot_id}"
+    if len(save_cb.encode("utf-8")) > TG_CALLBACK_LIMIT:
+        save_cb = save_cb[:TG_CALLBACK_LIMIT]
     return InlineKeyboardMarkup([[
-        InlineKeyboardButton("🔍 Полный анализ",
-                             callback_data=deep_callback_data(lot_id, an, lot, parsed_at)),
-        InlineKeyboardButton("⭐ Сохранить", callback_data=f"save_{lot_id}"),
+        InlineKeyboardButton("🔍 Полный анализ", callback_data=cb),
+        InlineKeyboardButton("⭐ Сохранить", callback_data=save_cb),
     ]])
 
 
