@@ -7,6 +7,8 @@ from telegram.ext import Application, CommandHandler, CallbackQueryHandler, Mess
 from dotenv import load_dotenv
 load_dotenv()
 
+from analyzer import MIN_DISCOUNT_PCT
+
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("bot_main")
@@ -47,6 +49,23 @@ REPLY_HOT    = "🔥 Горячие лоты"
 REPLY_RUN    = "🚀 Запустить анализ"
 REPLY_SAVED  = "⭐ Сохранённые"
 REPLY_BUTTONS = {REPLY_LATEST, REPLY_HOT, REPLY_RUN, REPLY_SAVED}
+
+
+def _discount_threshold_label() -> str:
+    """Порог дисконта для горячих лотов и дайджеста (MIN_DISCOUNT_PCT, по умолчанию 15%)."""
+    v = MIN_DISCOUNT_PCT
+    return f"{int(v)}%" if v == int(v) else f"{v:g}%"
+
+
+def _run_started_lines(label: str, region_name: str) -> str:
+    return (
+        f"🚀 *Анализ запущен!*\n\n"
+        f"📂 Категория: *{label}*\n"
+        f"📍 Регион: *{region_name}*\n\n"
+        f"⚡ Горячие лоты (дисконт ≥{_discount_threshold_label()}) — по мере тяжёлого анализа\n"
+        f"📦 Полный дайджест — в конце (~30–45 мин)\n"
+        f"📋 /latest — не ждать, открыть прошлый снимок"
+    )
 
 
 def reply_keyboard() -> ReplyKeyboardMarkup:
@@ -238,14 +257,7 @@ async def _launch_agent_run(chat_id: str, cat: str, bot):
 
     await bot.send_message(
         chat_id=chat_id,
-        text=(
-            f"🚀 *Анализ запущен!*\n\n"
-            f"📂 Категория: *{label}*\n"
-            f"📍 Регион: *{region_name}*\n\n"
-            f"⚡ Горячие лоты (дисконт ≥30%) — по мере тяжёлого анализа\n"
-            f"📦 Полный дайджест — в конце (~30–45 мин)\n"
-            f"📋 /latest — не ждать, открыть прошлый снимок"
-        ),
+        text=_run_started_lines(label, region_name),
         parse_mode="Markdown",
         reply_markup=reply_keyboard(),
     )
@@ -694,12 +706,7 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         }
         label = cat_names.get(cat, cat)
         await q.edit_message_text(
-            f"🚀 *Анализ запущен!*\n\n"
-            f"📂 Категория: *{label}*\n"
-            f"📍 Регион: *{region_name}*\n\n"
-            f"⚡ Горячие лоты (дисконт ≥30%) — по мере тяжёлого анализа\n"
-            f"📦 Полный дайджест — в конце (~30–45 мин)\n"
-            f"📋 /latest — не ждать, открыть прошлый снимок",
+            _run_started_lines(label, region_name),
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([[
                 InlineKeyboardButton("📋 Последние результаты", callback_data="latest"),
