@@ -21,6 +21,10 @@ COOKIES  = os.getenv("TBANKROT_COOKIES", "")
 MODEL    = "llama-3.1-8b-instant"
 MIN_SCORE = 0.0
 MIN_DISCOUNT_PCT = float(os.getenv("MIN_DISCOUNT_PCT", "15"))
+HOT_LABEL_PCT = float(os.getenv("HOT_LABEL_PCT", "10"))  # пометка 🔥, не фильтр дайджеста
+DIGEST_TOP_N = int(os.getenv("DIGEST_TOP_N", "10"))
+
+DIGEST_FORMULA = "45%×дисконт + 35%×низкая конкуренция + 20%×чистые документы"
 
 REGION_LABELS = {
     "moskva": "Москва", "moskovskaya-oblast": "Московская область",
@@ -165,24 +169,163 @@ def build_trading_summary(lot: dict) -> str:
     return " | ".join(parts)
 
 
+def _resolve_participants(lot: dict) -> int | None:
+    """Число заявок: карточка лота или среднее из аналитики торгов."""
+    p = lot.get("participants")
+    if p is not None and str(p).strip() != "":
+        try:
+            v = int(float(p))
+            if 0 <= v <= 500:
+                return v
+        except (TypeError, ValueError):
+            pass
+    ta = lot.get("trading_analytics") or {}
+    appr = lot.get("appraisal_parsed") or {}
+    hint = ta.get("participants_hint") or appr.get("auction_participants_hint", "")
+    if hint and str(hint) not in ("", "не указано"):
+        try:
+            return int(round(float(str(hint).replace(",", "."))))
+        except ValueError:
+            pass
+    return None
+
+
+def competition_level(participants: int | None) -> str:
+    if participants is None:
+        return "неизвестна"
+    if participants <= 2:
+        return "низкая"
+    if participants <= 5:
+        return "средняя"
+    return "высокая"
+
+
+def _documents_clean(lot: dict, an: dict) -> bool:
+    for rec in lot.get("egrn_records") or []:
+        if rec.get("encumbrances_clean"):
+            continue
+        enc = (rec.get("encumbrances") or "").strip().lower()
+        if enc and enc not in ("нет", "не зарегистрировано", "не указано", "отсутствуют"):
+            return False
+    egrn = lot.get("egrn_parsed") or {}
+    if egrn.get("encumbrances_clean"):
+        return True
+    enc = (an.get("encumbrances") or "").strip().lower()
+    if not enc:
+        return True
+    if enc in ("нет", "не зарегистрировано", "не указано", "отсутствуют"):
+        return True
+    return False
+
+
+def compute_digest_metrics(lot: dict, an: dict) -> dict:
+    """
+    Итоговый рейтинг для дайджеста (0–100):
+    45% — дисконт % (выше лучше)
+    35% — низкая конкуренция (меньше заявок — лучше)
+    20% — чистота документов (нет обременений — лучше)
+    """
+    disc_raw = an.get("discount_pct", "?")
+    try:
+        disc = float(disc_raw) if str(disc_raw) not in ("?", "", "0") else 0.0
+    except (TypeError, ValueError):
+        disc = 0.0
+    market_known = bool(an.get("market_known"))
+
+    if market_known and disc > 0:
+        disc_score = min(100.0, disc * 3.0)
+    elif disc > 0:
+        disc_score = min(60.0, disc * 2.0)
+    else:
+        disc_score = 0.0
+
+    pcount = _resolve_participants(lot)
+    comp_lvl = competition_level(pcount)
+    if pcount is None:
+        comp_score = 50.0
+    elif pcount == 0:
+        comp_score = 100.0
+    elif pcount <= 2:
+        comp_score = 85.0
+    elif pcount <= 5:
+        comp_score = 55.0
+    elif pcount <= 10:
+        comp_score = 30.0
+    else:
+        comp_score = 10.0
+
+    doc_clean = _documents_clean(lot, an)
+    doc_score = 100.0 if doc_clean else 35.0
+
+    rating = round(disc_score * 0.45 + comp_score * 0.35 + doc_score * 0.20, 1)
+    hot_label = bool(market_known and disc >= HOT_LABEL_PCT)
+
+    if hot_label and comp_lvl == "низкая":
+        section = "best"
+    elif disc >= 5 and comp_lvl in ("средняя", "высокая"):
+        section = "competitive"
+    elif doc_clean:
+        section = "clean"
+    else:
+        section = "other"
+
+    parts_disp = str(pcount) if pcount is not None else "н/д"
+    return {
+        "digest_rating": rating,
+        "competition_level": comp_lvl,
+        "participants_count": pcount,
+        "participants_display": parts_disp,
+        "documents_clean": doc_clean,
+        "documents_label": "нет" if doc_clean else "есть",
+        "hot_label": hot_label,
+        "digest_section": section,
+    }
+
+
+def enrich_digest_metrics(lot: dict, an: dict) -> dict:
+    """Добавляет поля рейтинга дайджеста к результату анализа."""
+    metrics = compute_digest_metrics(lot, an)
+    return {**an, **metrics}
+
+
 def format_short_lot_message(lot: dict, an: dict, label: str = "ЛОТ") -> str:
-    """Короткая карточка лота — балл, цена, дисконт, обременения, ссылка."""
+    """Короткая карточка: балл, цена, дисконт, конкуренция, обременения, ссылка."""
     score = an.get("total_score", "?")
     verdict = an.get("verdict_label") or an.get("verdict_simple") or an.get("action", "?")
     rn = f" 🌍 {lot.get('region', '')}" if lot.get("is_extra") else ""
+    hot = "🔥 " if an.get("hot_label") else ""
     lines = [
-        f"🔔 *{label} — {score}/10*{rn}",
+        f"🔔 *{hot}{label} — {score}/10*{rn}",
         f"{lot.get('title', '')[:70]}",
     ]
     if an.get("dedup_note"):
         lines.append(f"_{an['dedup_note']}_")
     lines.append(an.get("price_line") or format_price_line(an))
+
+    disc = an.get("discount_pct", "?")
+    disc_s = f"{disc}%" if str(disc) not in ("?", "", "0") else "не определён"
+    parts_d = an.get("participants_display")
+    if not parts_d:
+        p = _resolve_participants(lot)
+        parts_d = str(p) if p is not None else "н/д"
+    comp = an.get("competition_level") or competition_level(
+        an.get("participants_count") if an.get("participants_count") is not None
+        else _resolve_participants(lot)
+    )
+    doc_l = an.get("documents_label")
+    if not doc_l:
+        doc_l = "нет" if _documents_clean(lot, an) else "есть"
+    lines.append(f"📉 Дисконт: *{disc_s}* · 👥 заявок: *{parts_d}* ({comp})")
+    enc_line = f"📄 Обременения: *{doc_l}*"
+    if doc_l == "есть" and an.get("encumbrances"):
+        enc_line += f" — {an['encumbrances'][:70]}"
+    lines.append(enc_line)
+    dr = an.get("digest_rating")
+    if dr is not None:
+        lines.append(f"⭐ Рейтинг: *{dr}/100*")
+
     if an.get("lot_type") == "авто" and an.get("auto_summary"):
         lines.append(f"🚗 {an['auto_summary'][:100]}")
-    elif an.get("encumbrances"):
-        lines.append(f"🔒 {an['encumbrances'][:100]}")
-    elif an.get("legal_text"):
-        lines.append(f"📋 {an['legal_text'][:100]}")
     lines += [
         f"{an.get('action_emoji', '📋')} *{verdict}*",
         f"🔗 {lot.get('url', '')}",
@@ -1719,7 +1862,7 @@ async def analyze_lot(lot: dict, light: bool = False) -> dict:
     }
     discount_ok = market_known and disc_pct >= MIN_DISCOUNT_PCT
 
-    return {
+    result = {
         "lot_type":       lot_type,
         "total_score":    score,
         "score_label":    f"{'🔥' if score>=9 else '⭐' if score>=8 else '📊'} {score}/10",
@@ -1735,7 +1878,8 @@ async def analyze_lot(lot: dict, light: bool = False) -> dict:
         "market_coarse": mkt.get("market_coarse", False),
         "discount_pct":   an_stub["discount_pct"],
         "discount_ok":    discount_ok,
-        "qualifies_hot":  discount_ok and score >= 7.0,
+        "hot_label":      market_known and disc_pct >= HOT_LABEL_PCT,
+        "qualifies_hot":  market_known and disc_pct >= HOT_LABEL_PCT and score >= 7.0,
         "lot_price_raw":  lot_price,
         "market_price_raw": mkt_prc if market_known else 0,
         "price_line":     format_price_line(an_stub),
@@ -1779,3 +1923,5 @@ async def analyze_lot(lot: dict, light: bool = False) -> dict:
         "verdict_card": vr["verdict_card"],
         "manual_checks": vr["manual_checks"],
     }
+    result.update(compute_digest_metrics(lot, result))
+    return result
