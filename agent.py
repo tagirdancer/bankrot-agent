@@ -11,7 +11,9 @@ from playwright.async_api import async_playwright
 import telegram
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from analyzer import (analyze_lot, detect_type, get_lot_details, MIN_SCORE, MIN_DISCOUNT_PCT,
+                      HOT_LABEL_PCT, DIGEST_TOP_N, DIGEST_FORMULA,
                       format_short_lot_message, lot_action_keyboard, format_price_line,
+                      enrich_digest_metrics,
                       get_rosreestr_data, is_real_estate)
 from database import init_db, record_digest_lot, save_agent_run
 
@@ -854,6 +856,42 @@ def build_msgs(cat_key, results) -> list:
     return parts
 
 
+DIGEST_SECTIONS = (
+    ("best", "🔥", "Лучшие — высокий дисконт + мало заявок"),
+    ("competitive", "💰", "Выгодные, но конкурентные"),
+    ("clean", "✅", "Чистые документы"),
+    ("other", "📊", "Остальной топ"),
+)
+
+
+def build_digest_top10(heavy_map: dict, scored: list, cats: set, top_n: int = DIGEST_TOP_N) -> list:
+    """Топ-N по digest_rating из тяжёлой фазы; fallback на лёгкую, если тяжёлых нет."""
+    pool: list[tuple] = []
+    for _lot_id, (lot, an) in heavy_map.items():
+        cat = lot.get("category", "прочее")
+        if cats and cat not in cats:
+            continue
+        pool.append((lot, enrich_digest_metrics(lot, an)))
+    if not pool and scored:
+        for lot, light_an, _score, cat in scored:
+            if cats and cat not in cats:
+                continue
+            pool.append((lot, enrich_digest_metrics(lot, light_an)))
+    pool.sort(key=lambda x: float(x[1].get("digest_rating", 0) or 0), reverse=True)
+    return pool[:top_n]
+
+
+def digest_results_dict(digest_items: list) -> dict:
+    """Раскладывает топ дайджеста по категориям для сохранения в БД."""
+    out = {k: [] for k in CATEGORIES}
+    for lot, an in digest_items:
+        key = lot.get("category", "прочее")
+        if key not in out:
+            key = "прочее"
+        out[key].append((lot, an))
+    return out
+
+
 async def send(msgs, reply_markup=None, *, chat_id=None, bot=None):
     tg_bot = bot or telegram.Bot(token=TG_TOKEN)
     target = chat_id or TG_CHAT
@@ -897,12 +935,11 @@ async def send_lot_cards(lots_with_an, *, chat_id=None, bot=None, label_prefix="
         await asyncio.sleep(0.4)
 
 
-async def send_daily_digest(results, all_lots_count, alerts, skipped,
+async def send_daily_digest(digest_items, all_lots_count, alerts, skipped,
                             partial=False, stats=None, phase_note="",
                             stream_chat_id=None, stream_bot=None):
-    total = sum(len(v) for v in results.values())
-    go = sum(sum(1 for _, a in v if a.get("action") == "ВХОДИТЬ СЕЙЧАС")
-             for v in results.values())
+    total = len(digest_items)
+    go = sum(1 for _, a in digest_items if a.get("action") == "ВХОДИТЬ СЕЙЧАС")
     now = datetime.now().strftime("%d.%m.%Y %H:%M")
     partial_note = (
         "\n\n⚠️ _Частичный дайджест: не все лоты успели пройти тяжёлый анализ до лимита времени._"
@@ -915,41 +952,37 @@ async def send_daily_digest(results, all_lots_count, alerts, skipped,
             f"лёгкий: {stats.get('light_sec', 0):.0f}с ({stats.get('light_n', 0)} лот.) | "
             f"тяжёлый: {stats.get('heavy_sec', 0):.0f}с ({stats.get('heavy_n', 0)} лот.)"
         )
+    heavy_n = stats.get("heavy_n", 0) if stats else 0
     await send([
-        f"🌅 *Доброе утро! Дайджест {now}*{phase_note}{partial_note}\n\n"
-        f"🔍 Изучено: *{all_lots_count}* лотов\n"
-        f"⭐ В дайджесте: *{total}* лотов\n"
-        f"🟢 Входить сейчас: *{go}*\n"
-        f"🔔 Горячих алертов: *{alerts}*\n"
-        f"⏭ Отсеяно: *{skipped}*{stats_line}\n\n"
-        + "\n".join(
-            f"{CATEGORIES[k]['icon']} {CATEGORIES[k]['label']}: {len(v)} лотов"
-            for k, v in results.items() if v
-        )
-        + "\n\n_Короткие карточки ниже — «Полный анализ» по кнопке ↓_"
+        f"🌅 *Дайджест {now}*{phase_note}{partial_note}\n\n"
+        f"🔍 Изучено: *{all_lots_count}* лотов | тяжёлый анализ: *{heavy_n}*\n"
+        f"⭐ *Топ-{min(total, DIGEST_TOP_N)}* по рейтингу (не пустой — лучшие на сегодня)\n"
+        f"📐 _Рейтинг = {DIGEST_FORMULA}_\n"
+        f"🔥 пометка при дисконте ≥{int(HOT_LABEL_PCT)}%\n\n"
+        f"🟢 Входить сейчас: *{go}* | 🔔 горячих: *{alerts}* | ⏭ отсеяно: *{skipped}*{stats_line}\n\n"
+        "_Короткие карточки ниже — «Полный анализ» по кнопке ↓_"
     ], chat_id=stream_chat_id, bot=stream_bot)
     await asyncio.sleep(2)
 
     card_chat = stream_chat_id
     card_bot = stream_bot
-    for cat_key in ["квартира", "коммерция", "дом", "земля", "авто", "гараж", "бизнес", "прочее"]:
-        v = results.get(cat_key, [])
-        if not v:
+    buckets = {key: [] for key, _, _ in DIGEST_SECTIONS}
+    for lot, an in digest_items:
+        sec = an.get("digest_section", "other")
+        if sec not in buckets:
+            sec = "other"
+        buckets[sec].append((lot, an))
+
+    for sec_key, icon, title in DIGEST_SECTIONS:
+        items = buckets.get(sec_key, [])
+        if not items:
             continue
-        v.sort(
-            key=lambda x: (_discount_value(x[1]), float(x[1].get("total_score", 0) or 0)),
-            reverse=True,
-        )
-        cat = CATEGORIES[cat_key]
-        print(f"\n{cat['icon']} Отправляем {cat['label']}: {len(v)}")
+        print(f"\n{icon} {title}: {len(items)}")
         await send(
-            [f"{cat['icon']} *{cat['label']}* — {len(v)} лот(ов)"],
+            [f"{icon} *{title}* — {len(items)} лот(ов)"],
             chat_id=card_chat, bot=card_bot,
         )
-        await send_lot_cards(
-            v, chat_id=card_chat, bot=card_bot,
-            label_prefix=f"{cat['icon']} {cat['label']}",
-        )
+        await send_lot_cards(items, chat_id=card_chat, bot=card_bot, label_prefix=icon)
         await asyncio.sleep(1)
 
 
@@ -1026,6 +1059,8 @@ async def run(cats=None, include_extra=True, daily=True, *,
     partial = False
     heavy_map = {}
     all_lots = []
+    digest_items = []
+    scored = []
 
     async def _emit_hot(lot, an, preliminary=False):
         nonlocal alerts
@@ -1035,9 +1070,9 @@ async def run(cats=None, include_extra=True, daily=True, *,
         score = float(an.get("total_score", 0))
         if score < stream_min_score:
             return
-        if not an.get("discount_ok"):
+        if not an.get("hot_label"):
             return
-        label = "⚡ ГОРЯЧИЙ ЛОТ" if not preliminary else "⚡ ГОРЯЧИЙ (предварительно)"
+        label = "⚡ 🔥 ГОРЯЧИЙ" if not preliminary else "⚡ 🔥 (предварительно)"
         kb = lot_action_keyboard(lot_id, an, lot, lot.get("parsed_at"))
         msg = format_short_lot_message(lot, an, label)
         if lot_id in sent_hot_ids and not preliminary:
@@ -1206,18 +1241,18 @@ async def run(cats=None, include_extra=True, daily=True, *,
             print(f"\n📊 Тяжёлая фаза: 0 лотов ({stats['heavy_sec']:.0f}с)")
 
         results = _build_results(scored, heavy_map)
-        heavy_ids = set(heavy_map.keys())
-        # Дайджест: порог дисконта MIN_DISCOUNT_PCT (не балл 9+ — тот только для стриминга)
-        for cat_key in list(results.keys()):
-            results[cat_key] = [
-                (lot, an) for lot, an in results[cat_key]
-                if an.get("discount_ok")
-                or (lot["id"] in heavy_ids and _discount_value(an) > 0)
-            ]
-            results[cat_key].sort(
-                key=lambda x: (_discount_value(x[1]), float(x[1].get("total_score", 0) or 0)),
-                reverse=True,
+        digest_items = build_digest_top10(heavy_map, scored, set(cats))
+        results = digest_results_dict(digest_items)
+        print(
+            f"\n📊 Дайджест: топ-{len(digest_items)} по рейтингу "
+            f"({DIGEST_FORMULA}) | 🔥 от {HOT_LABEL_PCT}%"
+        )
+        if digest_items:
+            preview = ", ".join(
+                f"{lot['id']}:{an.get('digest_rating', '?')}"
+                for lot, an in digest_items[:5]
             )
+            print(f"   {preview}{'…' if len(digest_items) > 5 else ''}")
 
         await browser.close()
 
@@ -1228,7 +1263,7 @@ async def run(cats=None, include_extra=True, daily=True, *,
 
     if daily and not digest_sent:
         await send_daily_digest(
-            results, len(all_lots), alerts, skipped,
+            digest_items, len(all_lots), alerts, skipped,
             partial=partial, stats=stats,
             stream_chat_id=stream_chat_id, stream_bot=stream_bot,
         )
