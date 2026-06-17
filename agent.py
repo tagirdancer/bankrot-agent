@@ -1168,13 +1168,7 @@ async def run(cats=None, include_extra=True, daily=True, *,
 
         results = _build_results(scored, heavy_map)
         heavy_ids = set(heavy_map.keys())
-        if hot_only or min_result_score > MIN_SCORE:
-            for cat_key in list(results.keys()):
-                results[cat_key] = [
-                    (lot, an) for lot, an in results[cat_key]
-                    if float(an.get("total_score", 0) or 0) >= min_result_score
-                ]
-        # Дайджест: лоты с подтверждённым дисконтом; если тяжёлый анализ был — любой >0%
+        # Дайджест: порог дисконта MIN_DISCOUNT_PCT (не балл 9+ — тот только для стриминга)
         for cat_key in list(results.keys()):
             results[cat_key] = [
                 (lot, an) for lot, an in results[cat_key]
