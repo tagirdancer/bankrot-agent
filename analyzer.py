@@ -166,7 +166,7 @@ def build_trading_summary(lot: dict) -> str:
 
 
 def format_short_lot_message(lot: dict, an: dict, label: str = "ЛОТ") -> str:
-    """Короткий блок лота — единый формат для дайджеста и анализа по ссылке."""
+    """Короткая карточка лота — балл, цена, дисконт, обременения, ссылка."""
     score = an.get("total_score", "?")
     verdict = an.get("verdict_label") or an.get("verdict_simple") or an.get("action", "?")
     rn = f" 🌍 {lot.get('region', '')}" if lot.get("is_extra") else ""
@@ -177,37 +177,14 @@ def format_short_lot_message(lot: dict, an: dict, label: str = "ЛОТ") -> str:
     if an.get("dedup_note"):
         lines.append(f"_{an['dedup_note']}_")
     lines.append(an.get("price_line") or format_price_line(an))
-    if an.get("document_status"):
-        lines.append(f"📄 {an['document_status']}")
     if an.get("lot_type") == "авто" and an.get("auto_summary"):
-        lines.append(f"🚗 {an['auto_summary']}")
+        lines.append(f"🚗 {an['auto_summary'][:100]}")
+    elif an.get("encumbrances"):
+        lines.append(f"🔒 {an['encumbrances'][:100]}")
     elif an.get("legal_text"):
-        lt = an["legal_text"]
-        if an.get("encumbrances"):
-            lines.append(f"🔒 {an['encumbrances'][:100]}")
-        else:
-            lines.append(f"📋 {lt[:120]}")
-    if an.get("document_risk_level"):
-        asc = an.get("assessment_score")
-        if asc is not None:
-            lines.append(
-                f"📋 Риск: {an['document_risk_level']} | оценка {asc}/100"
-            )
-        else:
-            lines.append(f"📋 Риск по документам: {an['document_risk_level']}")
-    pluses = an.get("verdict_pluses") or []
-    minuses = an.get("verdict_minuses") or []
-    if pluses:
-        lines.append("✅ " + " | ".join(str(p) for p in pluses[:2]))
-    if minuses:
-        lines.append("⚠️ " + " | ".join(str(m) for m in minuses[:2]))
-    trading = an.get("trading_summary", "")
-    if trading:
-        lines.append(f"📋 {trading}")
-    detail = an.get("verdict_detail", "")
-    detail_s = f" — {detail[:90]}" if detail else ""
+        lines.append(f"📋 {an['legal_text'][:100]}")
     lines += [
-        f"{an.get('action_emoji', '📋')} *{verdict}*{detail_s}",
+        f"{an.get('action_emoji', '📋')} *{verdict}*",
         f"🔗 {lot.get('url', '')}",
     ]
     return "\n".join(lines)
@@ -741,24 +718,21 @@ def build_auto_verification_links(vin: str = "") -> str:
 
 
 def build_verification_links(cadastral: str, address: str = "", vin: str = "", lot_type: str = "") -> str:
-    """Прямые ссылки с подставленными данными."""
+    """Кликабельные ссылки для ручной проверки (без сырого URL в тексте)."""
     if lot_type == "авто":
         return build_auto_verification_links(vin)
     lines = []
     kad = (cadastral or "").strip()
     addr = (address or "").strip()
     if kad:
-        q = quote(kad)
-        lines.append(f"[Кадастровая карта НСПД](https://nspd.gov.ru/map?thematic=PKK&query={q})")
+        q = quote(kad, safe="")
+        lines.append(f"[Кадастровая карта](https://nspd.gov.ru/map?thematic=PKK&query={q})")
         lines.append(f"[Росреестр ПКК](https://pkk.rosreestr.ru/#/search?text={q})")
     else:
-        lines.append("кадастровый номер не найден — см. карточку лота или ЕГРН")
+        lines.append("Кадастровый номер не найден — см. карточку лота или ЕГРН")
+    lines.append("[ФССП — банк данных](https://fssp.gov.ru/iss/ip)")
     if addr:
-        lines.append(f"[ФССП — банк данных](https://fssp.gov.ru/iss/ip) — адрес для поиска: _{addr[:80]}_")
-        aq = quote(addr[:120])
-        lines.append(f"[Яндекс-карты (локация)](https://yandex.ru/maps/?text={aq})")
-    else:
-        lines.append("[ФССП — банк данных](https://fssp.gov.ru/iss/ip)")
+        lines.append(f"📍 Адрес для поиска: {addr[:80]}")
     return "\n".join(lines)
 
 
