@@ -148,9 +148,10 @@ def regions_menu():
     rows.append([InlineKeyboardButton("↩️ Назад", callback_data="back_menu")])
     return InlineKeyboardMarkup(rows)
 
-async def show_latest(update: Update, *, edit_message=None):
+async def show_latest(update: Update, *, edit_message=None, top_n: int = 12):
     """Показать снимок последнего прогона из БД — без нового запуска."""
     from database import get_latest_run, format_latest_run_messages
+    from analyzer import format_short_lot_message, lot_action_keyboard
     run = get_latest_run()
     chat_id = update.effective_chat.id
     bot = update.get_bot()
@@ -170,17 +171,45 @@ async def show_latest(update: Update, *, edit_message=None):
             )
         return
 
-    parts = format_latest_run_messages(run)
+    header_parts = format_latest_run_messages(run, top_n=top_n)
+    header = header_parts[0]
+    items = (run.get("results") or [])[:top_n]
+
     if edit_message:
-        await edit_message.edit_text(parts[0], parse_mode="Markdown", disable_web_page_preview=True)
-        for part in parts[1:]:
-            await bot.send_message(chat_id=chat_id, text=part, parse_mode="Markdown", disable_web_page_preview=True)
+        await edit_message.edit_text(header, parse_mode="Markdown", disable_web_page_preview=True)
     else:
-        for part in parts:
+        await bot.send_message(
+            chat_id=chat_id, text=header, parse_mode="Markdown",
+            disable_web_page_preview=True, reply_markup=reply_keyboard(),
+        )
+
+    for i, item in enumerate(items):
+        lot, an = item.get("lot", {}), item.get("an", {})
+        lot_id = str(lot.get("id", ""))
+        if lot_id:
+            lot_cache[lot_id] = {
+                "lot": lot, "an": an,
+                "cadastral": lot.get("cadastral", ""),
+                "address": lot.get("address", ""),
+                "parsed_at": lot.get("parsed_at"),
+            }
+        score = item.get("score", an.get("total_score", "?"))
+        label = f"#{i + 1} · {score}/10"
+        kb = lot_action_keyboard(lot_id, an, lot, lot.get("parsed_at"))
+        card = format_short_lot_message(lot, an, label)
+        try:
             await bot.send_message(
-                chat_id=chat_id, text=part, parse_mode="Markdown",
-                disable_web_page_preview=True, reply_markup=reply_keyboard(),
+                chat_id=chat_id, text=card, parse_mode="Markdown",
+                disable_web_page_preview=True, reply_markup=kb,
             )
+        except Exception:
+            log.exception("latest lot card failed id=%s", lot_id)
+            plain = card.replace("*", "").replace("_", "")
+            await bot.send_message(
+                chat_id=chat_id, text=plain,
+                disable_web_page_preview=True, reply_markup=kb,
+            )
+
     await bot.send_message(chat_id=chat_id, text="📱 Меню:", reply_markup=main_menu())
 
 
