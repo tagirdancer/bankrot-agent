@@ -11,9 +11,10 @@ from playwright.async_api import async_playwright
 import telegram
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from analyzer import (analyze_lot, detect_type, get_lot_details, MIN_SCORE, MIN_DISCOUNT_PCT,
-                      HOT_LABEL_PCT, DIGEST_TOP_N, DIGEST_FORMULA,
-                      format_short_lot_message, lot_action_keyboard, format_price_line,
-                      enrich_digest_metrics,
+                      HOT_LABEL_PCT, DIGEST_TOP_N, DIGEST_FORMULA, TG_MSG_LIMIT,
+                      format_short_lot_message, format_short_lot_message_plain,
+                      format_minimal_lot_card, lot_action_keyboard, format_price_line,
+                      enrich_digest_metrics, clamp_telegram_message,
                       get_rosreestr_data, is_real_estate)
 from database import init_db, record_digest_lot, save_agent_run
 
@@ -907,83 +908,156 @@ async def send(msgs, reply_markup=None, *, chat_id=None, bot=None):
             print(f"  TG: {e}")
 
 
-async def send_lot_cards(lots_with_an, *, chat_id=None, bot=None, label_prefix=""):
-    """Короткая карточка + кнопки «Полный анализ» / «Сохранить» на каждый лот."""
-    tg_bot = bot or telegram.Bot(token=TG_TOKEN)
-    target = chat_id or TG_CHAT
-    for i, (lot, an) in enumerate(lots_with_an):
-        lot_id = lot.get("id", "")
-        label = f"{label_prefix} #{i + 1}" if label_prefix else f"#{i + 1}"
-        msg = format_short_lot_message(lot, an, label)
-        kb = lot_action_keyboard(lot_id, an, lot, lot.get("parsed_at"))
+async def _send_one_lot_card(tg_bot, target, lot, an, label) -> tuple[bool, str]:
+    """Отправить одну карточку; несколько стратегий при ошибке Markdown."""
+    lot_id = str(lot.get("id", "?"))
+    variants = []
+    try:
+        variants.append(("md", format_short_lot_message(lot, an, label), True))
+    except Exception as e:
+        return False, f"format: {e}"
+    try:
+        variants.append(("plain", format_short_lot_message_plain(lot, an, label), False))
+    except Exception:
+        pass
+    variants.append(("minimal", format_minimal_lot_card(lot, an, label), False))
+
+    last_err = ""
+    for _mode, text, use_md in variants:
+        text = clamp_telegram_message(text)
+        kb = None
+        try:
+            kb = lot_action_keyboard(lot_id, an, lot, lot.get("parsed_at"))
+        except Exception as e:
+            last_err = f"keyboard: {e}"
+            log.exception("lot card keyboard failed id=%s", lot_id)
+            continue
         try:
             await tg_bot.send_message(
-                chat_id=target, text=msg,
-                parse_mode="Markdown", disable_web_page_preview=True,
+                chat_id=target, text=text,
+                parse_mode="Markdown" if use_md else None,
+                disable_web_page_preview=True,
                 reply_markup=kb,
             )
+            return True, ""
         except Exception as e:
-            print(f"  TG lot card: {e}")
-            plain = msg.replace("*", "").replace("_", "")
-            try:
-                await tg_bot.send_message(
-                    chat_id=target, text=plain,
-                    disable_web_page_preview=True, reply_markup=kb,
-                )
-            except Exception as e2:
-                print(f"  TG lot card plain: {e2}")
+            last_err = f"{_mode}: {e}"
+            log.warning("lot card send %s failed id=%s: %s", _mode, lot_id, e)
+    return False, last_err or "unknown"
+
+
+async def send_lot_cards(lots_with_an, *, chat_id=None, bot=None, label_prefix=""):
+    """Короткая карточка + кнопки; один битый лот не роняет остальные."""
+    tg_bot = bot or telegram.Bot(token=TG_TOKEN)
+    target = chat_id or TG_CHAT
+    stats = {"sent": 0, "failed": 0, "total": len(lots_with_an), "errors": []}
+    for i, (lot, an) in enumerate(lots_with_an):
+        lot_id = str(lot.get("id", "?"))
+        label = f"{label_prefix} #{i + 1}" if label_prefix else f"#{i + 1}"
+        try:
+            ok, err = await _send_one_lot_card(tg_bot, target, lot, an, label)
+        except Exception as e:
+            ok, err = False, str(e)
+            log.exception("lot card unexpected id=%s", lot_id)
+        if ok:
+            stats["sent"] += 1
+        else:
+            stats["failed"] += 1
+            stats["errors"].append({"id": lot_id, "reason": err[:200]})
+            print(f"  ⚠️ карточка {lot_id} пропущена: {err}")
         await asyncio.sleep(0.4)
+    return stats
+
+
+def _format_digest_send_summary(card_stats: dict, total_expected: int) -> str:
+    sent = card_stats.get("sent", 0)
+    failed = card_stats.get("failed", 0)
+    lines = [f"📬 *Итог дайджеста:* отправлено карточек *{sent}* из *{total_expected}*"]
+    errors = card_stats.get("errors") or []
+    if failed:
+        lines.append(f"⚠️ Пропущено: *{failed}*")
+        for item in errors[:5]:
+            lines.append(f"• лот `{item.get('id', '?')}`: {item.get('reason', '?')[:80]}")
+        if len(errors) > 5:
+            lines.append(f"_…и ещё {len(errors) - 5}_")
+    return "\n".join(lines)
 
 
 async def send_daily_digest(digest_items, all_lots_count, alerts, skipped,
                             partial=False, stats=None, phase_note="",
                             stream_chat_id=None, stream_bot=None):
     total = len(digest_items)
-    go = sum(1 for _, a in digest_items if a.get("action") == "ВХОДИТЬ СЕЙЧАС")
-    now = datetime.now().strftime("%d.%m.%Y %H:%M")
-    partial_note = (
-        "\n\n⚠️ _Частичный дайджест: не все лоты успели пройти тяжёлый анализ до лимита времени._"
-        if partial else ""
-    )
-    stats_line = ""
-    if stats:
-        stats_line = (
-            f"\n⏱ Сбор: {stats.get('collect_sec', 0):.0f}с | "
-            f"лёгкий: {stats.get('light_sec', 0):.0f}с ({stats.get('light_n', 0)} лот.) | "
-            f"тяжёлый: {stats.get('heavy_sec', 0):.0f}с ({stats.get('heavy_n', 0)} лот.)"
+    card_stats = {"sent": 0, "failed": 0, "total": total, "errors": []}
+    try:
+        go = sum(1 for _, a in digest_items if a.get("action") == "ВХОДИТЬ СЕЙЧАС")
+        now = datetime.now().strftime("%d.%m.%Y %H:%M")
+        partial_note = (
+            "\n\n⚠️ _Частичный дайджест: не все лоты успели пройти тяжёлый анализ до лимита времени._"
+            if partial else ""
         )
-    heavy_n = stats.get("heavy_n", 0) if stats else 0
-    await send([
-        f"🌅 *Дайджест {now}*{phase_note}{partial_note}\n\n"
-        f"🔍 Изучено: *{all_lots_count}* лотов | тяжёлый анализ: *{heavy_n}*\n"
-        f"⭐ *Топ-{min(total, DIGEST_TOP_N)}* по рейтингу (не пустой — лучшие на сегодня)\n"
-        f"📐 _Рейтинг = {DIGEST_FORMULA}_\n"
-        f"🔥 пометка при дисконте ≥{int(HOT_LABEL_PCT)}%\n\n"
-        f"🟢 Входить сейчас: *{go}* | 🔔 горячих: *{alerts}* | ⏭ отсеяно: *{skipped}*{stats_line}\n\n"
-        "_Короткие карточки ниже — «Полный анализ» по кнопке ↓_"
-    ], chat_id=stream_chat_id, bot=stream_bot)
-    await asyncio.sleep(2)
+        stats_line = ""
+        if stats:
+            stats_line = (
+                f"\n⏱ Сбор: {stats.get('collect_sec', 0):.0f}с | "
+                f"лёгкий: {stats.get('light_sec', 0):.0f}с ({stats.get('light_n', 0)} лот.) | "
+                f"тяжёлый: {stats.get('heavy_sec', 0):.0f}с ({stats.get('heavy_n', 0)} лот.)"
+            )
+        heavy_n = stats.get("heavy_n", 0) if stats else 0
+        await send([
+            f"🌅 *Дайджест {now}*{phase_note}{partial_note}\n\n"
+            f"🔍 Изучено: *{all_lots_count}* лотов | тяжёлый анализ: *{heavy_n}*\n"
+            f"⭐ *Топ-{min(total, DIGEST_TOP_N)}* по рейтингу (не пустой — лучшие на сегодня)\n"
+            f"📐 _Рейтинг = {DIGEST_FORMULA}_\n"
+            f"🔥 пометка при дисконте ≥{int(HOT_LABEL_PCT)}%\n\n"
+            f"🟢 Входить сейчас: *{go}* | 🔔 горячих: *{alerts}* | ⏭ отсеяно: *{skipped}*{stats_line}\n\n"
+            "_Короткие карточки ниже — «Полный анализ» по кнопке ↓_"
+        ], chat_id=stream_chat_id, bot=stream_bot)
+        await asyncio.sleep(2)
 
-    card_chat = stream_chat_id
-    card_bot = stream_bot
-    buckets = {key: [] for key, _, _ in DIGEST_SECTIONS}
-    for lot, an in digest_items:
-        sec = an.get("digest_section", "other")
-        if sec not in buckets:
-            sec = "other"
-        buckets[sec].append((lot, an))
+        card_chat = stream_chat_id
+        card_bot = stream_bot
+        buckets = {key: [] for key, _, _ in DIGEST_SECTIONS}
+        for lot, an in digest_items:
+            sec = an.get("digest_section", "other")
+            if sec not in buckets:
+                sec = "other"
+            buckets[sec].append((lot, an))
 
-    for sec_key, icon, title in DIGEST_SECTIONS:
-        items = buckets.get(sec_key, [])
-        if not items:
-            continue
-        print(f"\n{icon} {title}: {len(items)}")
+        for sec_key, icon, title in DIGEST_SECTIONS:
+            items = buckets.get(sec_key, [])
+            if not items:
+                continue
+            print(f"\n{icon} {title}: {len(items)}")
+            try:
+                await send(
+                    [f"{icon} *{title}* — {len(items)} лот(ов)"],
+                    chat_id=card_chat, bot=card_bot,
+                )
+            except Exception:
+                log.exception("digest section header failed: %s", title)
+            sec_stats = await send_lot_cards(
+                items, chat_id=card_chat, bot=card_bot, label_prefix=icon,
+            )
+            card_stats["sent"] += sec_stats["sent"]
+            card_stats["failed"] += sec_stats["failed"]
+            card_stats["errors"].extend(sec_stats["errors"])
+            await asyncio.sleep(1)
+
         await send(
-            [f"{icon} *{title}* — {len(items)} лот(ов)"],
-            chat_id=card_chat, bot=card_bot,
+            [_format_digest_send_summary(card_stats, total)],
+            chat_id=stream_chat_id, bot=stream_bot,
         )
-        await send_lot_cards(items, chat_id=card_chat, bot=card_bot, label_prefix=icon)
-        await asyncio.sleep(1)
+    except Exception:
+        log.exception("send_daily_digest failed")
+        try:
+            await send(
+                [_format_digest_send_summary(card_stats, total)
+                 + "\n\n⚠️ _Дайджест отправлен частично из-за ошибки._"],
+                chat_id=stream_chat_id, bot=stream_bot,
+            )
+        except Exception:
+            log.exception("digest summary send failed")
+    return card_stats
 
 
 def _discount_value(an: dict) -> float:
@@ -1262,11 +1336,14 @@ async def run(cats=None, include_extra=True, daily=True, *,
           f"Тяжёлый {stats['heavy_sec']:.0f}s")
 
     if daily and not digest_sent:
-        await send_daily_digest(
-            digest_items, len(all_lots), alerts, skipped,
-            partial=partial, stats=stats,
-            stream_chat_id=stream_chat_id, stream_bot=stream_bot,
-        )
+        try:
+            await send_daily_digest(
+                digest_items, len(all_lots), alerts, skipped,
+                partial=partial, stats=stats,
+                stream_chat_id=stream_chat_id, stream_bot=stream_bot,
+            )
+        except Exception:
+            log.exception("digest delivery failed — прогон продолжен")
         digest_sent = True
 
     if save_to_db:
