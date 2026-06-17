@@ -181,6 +181,7 @@ def save_agent_run(started_at: str, run_type: str, categories, results: dict,
             })
     flat.sort(
         key=lambda x: (
+            float(x["an"].get("digest_rating", 0) or 0),
             _discount_from_an(x["an"]),
             x["score"],
         ),
@@ -242,7 +243,7 @@ def format_latest_run_header(run: dict) -> str:
             f"лёгкий {stats.get('light_sec', 0):.0f}с | "
             f"тяжёлый {stats.get('heavy_sec', 0):.0f}с\n"
         )
-    header += "_Короткие карточки — «Полный анализ» по кнопке ↓_"
+    header += "_Топ по рейтингу — «Полный анализ» по кнопке ↓_"
     return header
 
 
