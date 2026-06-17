@@ -796,7 +796,7 @@ def fmt_block(lot, an, i=0) -> str:
     urgency = f"\n{an['urgency']}" if an.get('urgency') else ""
     mkt    = f"\n_📊 {an['market_comment']}_" if an.get('market_comment') and not an.get('market_known') else ""
     extra  = f"\n{an['extra_checks']}" if an.get('extra_checks') else ""
-    check  = f"\n🔎 _{an['what_to_check']}_" if an.get('what_to_check') else ""
+    check  = f"\n🔎 {an['what_to_check']}" if an.get('what_to_check') else ""
     encumb = f"\n🔒 {an['encumbrances']}" if an.get('encumbrances') else ""
     exit_s = f"\n🚪 Выход: {an['exit_strategy']}" if an.get('exit_strategy') else ""
     doc_st = f"\n📄 _{an['document_status']}_" if an.get('document_status') else ""
@@ -854,22 +854,52 @@ def build_msgs(cat_key, results) -> list:
     return parts
 
 
-async def send(msgs, reply_markup=None):
-    bot = telegram.Bot(token=TG_TOKEN)
+async def send(msgs, reply_markup=None, *, chat_id=None, bot=None):
+    tg_bot = bot or telegram.Bot(token=TG_TOKEN)
+    target = chat_id or TG_CHAT
     for msg in msgs:
         try:
-            await bot.send_message(
-                chat_id=TG_CHAT, text=msg,
+            await tg_bot.send_message(
+                chat_id=target, text=msg,
                 parse_mode="Markdown", disable_web_page_preview=True,
-                reply_markup=reply_markup
+                reply_markup=reply_markup,
             )
             await asyncio.sleep(1)
         except Exception as e:
             print(f"  TG: {e}")
 
 
+async def send_lot_cards(lots_with_an, *, chat_id=None, bot=None, label_prefix=""):
+    """Короткая карточка + кнопки «Полный анализ» / «Сохранить» на каждый лот."""
+    tg_bot = bot or telegram.Bot(token=TG_TOKEN)
+    target = chat_id or TG_CHAT
+    for i, (lot, an) in enumerate(lots_with_an):
+        lot_id = lot.get("id", "")
+        label = f"{label_prefix} #{i + 1}" if label_prefix else f"#{i + 1}"
+        msg = format_short_lot_message(lot, an, label)
+        kb = lot_action_keyboard(lot_id, an, lot, lot.get("parsed_at"))
+        try:
+            await tg_bot.send_message(
+                chat_id=target, text=msg,
+                parse_mode="Markdown", disable_web_page_preview=True,
+                reply_markup=kb,
+            )
+        except Exception as e:
+            print(f"  TG lot card: {e}")
+            plain = msg.replace("*", "").replace("_", "")
+            try:
+                await tg_bot.send_message(
+                    chat_id=target, text=plain,
+                    disable_web_page_preview=True, reply_markup=kb,
+                )
+            except Exception as e2:
+                print(f"  TG lot card plain: {e2}")
+        await asyncio.sleep(0.4)
+
+
 async def send_daily_digest(results, all_lots_count, alerts, skipped,
-                            partial=False, stats=None, phase_note=""):
+                            partial=False, stats=None, phase_note="",
+                            stream_chat_id=None, stream_bot=None):
     total = sum(len(v) for v in results.values())
     go = sum(sum(1 for _, a in v if a.get("action") == "ВХОДИТЬ СЕЙЧАС")
              for v in results.values())
@@ -896,10 +926,12 @@ async def send_daily_digest(results, all_lots_count, alerts, skipped,
             f"{CATEGORIES[k]['icon']} {CATEGORIES[k]['label']}: {len(v)} лотов"
             for k, v in results.items() if v
         )
-        + "\n\n_Детальный разбор по категориям ниже ↓_"
-    ])
+        + "\n\n_Короткие карточки ниже — «Полный анализ» по кнопке ↓_"
+    ], chat_id=stream_chat_id, bot=stream_bot)
     await asyncio.sleep(2)
 
+    card_chat = stream_chat_id
+    card_bot = stream_bot
     for cat_key in ["квартира", "коммерция", "дом", "земля", "авто", "гараж", "бизнес", "прочее"]:
         v = results.get(cat_key, [])
         if not v:
@@ -910,8 +942,15 @@ async def send_daily_digest(results, all_lots_count, alerts, skipped,
         )
         cat = CATEGORIES[cat_key]
         print(f"\n{cat['icon']} Отправляем {cat['label']}: {len(v)}")
-        await send(build_msgs(cat_key, v))
-        await asyncio.sleep(2)
+        await send(
+            [f"{cat['icon']} *{cat['label']}* — {len(v)} лот(ов)"],
+            chat_id=card_chat, bot=card_bot,
+        )
+        await send_lot_cards(
+            v, chat_id=card_chat, bot=card_bot,
+            label_prefix=f"{cat['icon']} {cat['label']}",
+        )
+        await asyncio.sleep(1)
 
 
 def _discount_value(an: dict) -> float:
@@ -1191,6 +1230,7 @@ async def run(cats=None, include_extra=True, daily=True, *,
         await send_daily_digest(
             results, len(all_lots), alerts, skipped,
             partial=partial, stats=stats,
+            stream_chat_id=stream_chat_id, stream_bot=stream_bot,
         )
         digest_sent = True
 
