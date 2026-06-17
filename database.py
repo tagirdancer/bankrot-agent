@@ -221,10 +221,8 @@ def get_latest_run() -> dict | None:
     return data
 
 
-def format_latest_run_messages(run: dict, top_n: int = 12) -> list:
-    """Текст для /latest — готовый снимок без нового прогона."""
-    from analyzer import format_short_lot_message
-
+def format_latest_run_header(run: dict) -> str:
+    """Заголовок снимка для /latest."""
     try:
         finished = datetime.fromisoformat(run["finished_at"]).strftime("%d.%m.%Y %H:%M")
     except Exception:
@@ -244,18 +242,14 @@ def format_latest_run_messages(run: dict, top_n: int = 12) -> list:
             f"лёгкий {stats.get('light_sec', 0):.0f}с | "
             f"тяжёлый {stats.get('heavy_sec', 0):.0f}с\n"
         )
-    header += "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+    header += "_Короткие карточки — «Полный анализ» по кнопке ↓_"
+    return header
+
+
+def format_latest_run_messages(run: dict, top_n: int = 12) -> list:
+    """Текст для /latest — только заголовок (карточки шлёт bot_main отдельно)."""
     items = run.get("results") or []
+    header = format_latest_run_header(run)
     if not items:
-        return [header + "_Лотов в снимке нет — дождитесь следующего прогона._"]
-    parts, current = [], header
-    for i, item in enumerate(items[:top_n]):
-        lot, an = item.get("lot", {}), item.get("an", {})
-        block = format_short_lot_message(lot, an, f"#{i + 1} · {item.get('score', '?')}/10") + "\n\n"
-        if len(current) + len(block) > 3800:
-            parts.append(current)
-            current = block
-        else:
-            current += block
-    parts.append(current)
-    return parts
+        return [header + "\n\n_Лотов в снимке нет — дождитесь следующего прогона._"]
+    return [header]
