@@ -21,7 +21,7 @@ from database import init_db, record_digest_lot, save_agent_run
 load_dotenv()
 log = logging.getLogger("agent")
 
-from platform_config import is_tbankrot_enabled
+from platform_config import is_tbankrot_enabled, is_mass_scraping_enabled
 
 LOGIN    = os.getenv("TBANKROT_LOGIN")
 PASSWORD = os.getenv("TBANKROT_PASSWORD")
@@ -285,12 +285,22 @@ async def _submit_login_form(page) -> str:
 LAST_LOGIN_REASON = ""
 
 
+async def page_access_blocked(page) -> bool:
+    """Cloudflare / Access denied / антибот на странице."""
+    try:
+        from platform_config import page_body_blocked
+        body = await page.content()
+        return page_body_blocked(body)
+    except Exception:
+        return False
+
+
 async def login(page) -> bool:
     global LAST_LOGIN_REASON
     LAST_LOGIN_REASON = ""
     if not is_tbankrot_enabled():
         LAST_LOGIN_REASON = "disabled"
-        log.info("[login] skipped — TBANKROT_ENABLED=0")
+        log.info("[login] skipped — tbankrot access disabled")
         return False
     login_set = bool(LOGIN and LOGIN.strip())
     pwd_set = bool(PASSWORD and PASSWORD.strip())
@@ -1112,8 +1122,8 @@ async def run(cats=None, include_extra=True, daily=True, *,
               stream_min_score=9.0, min_result_score=None,
               hot_only=False, region_filter=None):
     init_db()
-    if not is_tbankrot_enabled():
-        log.info("agent.run skipped — TBANKROT_ENABLED=0")
+    if not is_mass_scraping_enabled():
+        log.info("agent.run skipped — mass scraping disabled")
         return {k: [] for k in CATEGORIES}
     if save_to_db is None:
         save_to_db = os.getenv("AGENT_SAVE_DB", "1") != "0"
