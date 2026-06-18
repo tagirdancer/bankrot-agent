@@ -51,6 +51,19 @@ def init_db():
         results_json TEXT
     );
     CREATE INDEX IF NOT EXISTS idx_agent_runs_finished ON agent_runs(finished_at DESC);
+    CREATE TABLE IF NOT EXISTS recent_lots (
+        chat_id TEXT NOT NULL,
+        lot_id TEXT NOT NULL,
+        title TEXT,
+        url TEXT,
+        score REAL,
+        discount REAL,
+        lot_json TEXT,
+        an_json TEXT,
+        checked_at TEXT,
+        PRIMARY KEY (chat_id, lot_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_recent_lots_checked ON recent_lots(chat_id, checked_at DESC);
     """)
     conn.commit()
     conn.close()
@@ -206,6 +219,55 @@ def save_agent_run(started_at: str, run_type: str, categories, results: dict,
     conn.commit()
     conn.close()
     return run_id
+
+
+def record_recent_lot(chat_id: str, lot: dict, an: dict):
+    """Последние проверенные лоты пользователя (режим «один лот»)."""
+    conn = get_conn()
+    now = datetime.now().isoformat()
+    lot_id = str(lot.get("id", ""))
+    if not lot_id:
+        conn.close()
+        return
+    conn.execute("""
+        INSERT INTO recent_lots (chat_id, lot_id, title, url, score, discount, lot_json, an_json, checked_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(chat_id, lot_id) DO UPDATE SET
+            title=excluded.title, url=excluded.url, score=excluded.score,
+            discount=excluded.discount, lot_json=excluded.lot_json,
+            an_json=excluded.an_json, checked_at=excluded.checked_at
+    """, (
+        str(chat_id), lot_id, lot.get("title", ""), lot.get("url", ""),
+        float(an.get("total_score", 0) or 0),
+        float(an.get("discount_pct", 0) or 0),
+        json.dumps(lot, ensure_ascii=False, default=str),
+        json.dumps({k: an[k] for k in an if k != "extra_checks"}, ensure_ascii=False, default=str),
+        now,
+    ))
+    conn.commit()
+    conn.close()
+
+
+def get_recent_lots(chat_id: str, limit: int = 10) -> list:
+    conn = get_conn()
+    rows = conn.execute(
+        "SELECT * FROM recent_lots WHERE chat_id=? ORDER BY checked_at DESC LIMIT ?",
+        (str(chat_id), limit),
+    ).fetchall()
+    conn.close()
+    out = []
+    for r in rows:
+        item = dict(r)
+        try:
+            item["lot"] = json.loads(item.pop("lot_json") or "{}")
+        except Exception:
+            item["lot"] = {}
+        try:
+            item["an"] = json.loads(item.pop("an_json") or "{}")
+        except Exception:
+            item["an"] = {}
+        out.append(item)
+    return out
 
 
 def get_latest_run() -> dict | None:
