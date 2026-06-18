@@ -1,5 +1,5 @@
-# v2.1 — расписание + /latest + стриминг при ручном запуске
-import asyncio, os, re, logging
+# v2.2 — режим «один лот по запросу», массовый сбор отключён по умолчанию
+import asyncio, os, re, logging, random
 from datetime import datetime, time
 from zoneinfo import ZoneInfo
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, ReplyKeyboardMarkup
@@ -7,7 +7,11 @@ from telegram.ext import Application, CommandHandler, CallbackQueryHandler, Mess
 from dotenv import load_dotenv
 load_dotenv()
 
-from platform_config import is_tbankrot_enabled, platform_status_message, tbankrot_disabled_message
+from platform_config import (
+    is_single_lot_enabled, is_mass_scraping_enabled, is_tbankrot_enabled,
+    platform_status_message, tbankrot_disabled_message, mass_scraping_disabled_message,
+    tbankrot_access_limited_message, analyze_lot_hint, TbankrotAccessError,
+)
 from analyzer import MIN_DISCOUNT_PCT
 
 logging.basicConfig(level=logging.INFO,
@@ -45,11 +49,14 @@ REGIONS = {
 }
 
 # Постоянное нижнее меню (reply-кнопки)
-REPLY_LATEST = "📋 Последние результаты"
+REPLY_ANALYZE = "📊 Анализ лота"
+REPLY_SAVED   = "⭐ Сохранённые"
+REPLY_RECENT  = "📋 Последние проверенные"
+REPLY_BUTTONS = {REPLY_ANALYZE, REPLY_SAVED, REPLY_RECENT}
+# Старые кнопки (массовый режим) — оставлены для совместимости, не в меню
+REPLY_LATEST = REPLY_RECENT
 REPLY_HOT    = "🔥 Горячие лоты"
 REPLY_RUN    = "🚀 Запустить анализ"
-REPLY_SAVED  = "⭐ Сохранённые"
-REPLY_BUTTONS = {REPLY_LATEST, REPLY_HOT, REPLY_RUN, REPLY_SAVED}
 
 
 def _discount_threshold_label() -> str:
@@ -72,8 +79,8 @@ def _run_started_lines(label: str, region_name: str) -> str:
 def reply_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         [
-            [KeyboardButton(REPLY_LATEST), KeyboardButton(REPLY_HOT)],
-            [KeyboardButton(REPLY_RUN), KeyboardButton(REPLY_SAVED)],
+            [KeyboardButton(REPLY_ANALYZE)],
+            [KeyboardButton(REPLY_SAVED), KeyboardButton(REPLY_RECENT)],
         ],
         resize_keyboard=True,
         one_time_keyboard=False,
@@ -120,21 +127,9 @@ def run_category_menu():
 
 def main_menu():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📋 Последние результаты", callback_data="latest")],
-        [InlineKeyboardButton("🚀 Запустить анализ", callback_data="menu_run")],
-        [InlineKeyboardButton("🗺 Выбрать регион",   callback_data="menu_regions")],
-        [
-            InlineKeyboardButton("🏠 Квартиры",  callback_data="run_квартира"),
-            InlineKeyboardButton("🏢 Коммерция", callback_data="run_коммерция"),
-        ],
-        [
-            InlineKeyboardButton("🏡 Дома",  callback_data="run_дом"),
-            InlineKeyboardButton("🌱 Земля", callback_data="run_земля"),
-        ],
-        [
-            InlineKeyboardButton("🚗 Авто",        callback_data="run_авто"),
-            InlineKeyboardButton("⚡ Горячие 9+",  callback_data="run_hot"),
-        ],
+        [InlineKeyboardButton("📊 Анализ лота", callback_data="help_analyze")],
+        [InlineKeyboardButton("📋 Последние проверенные", callback_data="recent")],
+        [InlineKeyboardButton("⭐ Сохранённые", callback_data="saved")],
         [InlineKeyboardButton("📊 Статус", callback_data="status")],
     ])
 
@@ -149,8 +144,86 @@ def regions_menu():
     rows.append([InlineKeyboardButton("↩️ Назад", callback_data="back_menu")])
     return InlineKeyboardMarkup(rows)
 
+def _cache_lot_result(lot_id: str, lot: dict, an: dict, parsed_at):
+    ts = int(parsed_at.timestamp()) if hasattr(parsed_at, "timestamp") else parsed_at
+    lot_cache[lot_id] = {
+        "lot": lot, "an": an,
+        "cadastral": lot.get("cadastral", ""),
+        "address": lot.get("address", ""),
+        "parsed_at": ts,
+    }
+
+
+def _record_checked_lot(chat_id, lot: dict, an: dict):
+    from database import record_recent_lot
+    try:
+        record_recent_lot(str(chat_id), lot, an)
+    except Exception:
+        log.exception("record_recent_lot failed id=%s", lot.get("id"))
+
+
+async def show_recent_checked(update: Update, *, edit_message=None, top_n: int = 10):
+    """Последние лоты, которые пользователь проверял в режиме «один лот»."""
+    from database import get_recent_lots
+    from analyzer import format_short_lot_message, lot_action_keyboard
+    chat_id = update.effective_chat.id
+    bot = update.get_bot()
+    items = get_recent_lots(chat_id, limit=top_n)
+
+    if not items:
+        text = (
+            "📋 *Последних проверенных лотов пока нет.*\n\n"
+            "Пришлите ссылку или номер лота — результат появится здесь.\n\n"
+            + analyze_lot_hint().split("\n\n", 1)[-1]
+        )
+        if edit_message:
+            await edit_message.edit_text(text, parse_mode="Markdown", reply_markup=main_menu())
+        else:
+            await bot.send_message(
+                chat_id=chat_id, text=text, parse_mode="Markdown",
+                reply_markup=reply_keyboard(),
+            )
+        return
+
+    header = f"📋 *Последние проверенные* ({len(items)})\n"
+    if edit_message:
+        await edit_message.edit_text(header, parse_mode="Markdown", disable_web_page_preview=True)
+    else:
+        await bot.send_message(
+            chat_id=chat_id, text=header, parse_mode="Markdown",
+            disable_web_page_preview=True, reply_markup=reply_keyboard(),
+        )
+
+    for i, item in enumerate(items):
+        lot, an = item.get("lot", {}), item.get("an", {})
+        lot_id = str(lot.get("id", item.get("lot_id", "")))
+        if lot_id:
+            _cache_lot_result(lot_id, lot, an, item.get("checked_at") or datetime.now())
+        score = an.get("total_score", item.get("score", "?"))
+        label = f"#{i + 1} · {score}/10"
+        kb = lot_action_keyboard(lot_id, an, lot, lot.get("parsed_at"))
+        card = format_short_lot_message(lot, an, label)
+        try:
+            await bot.send_message(
+                chat_id=chat_id, text=card, parse_mode="Markdown",
+                disable_web_page_preview=True, reply_markup=kb,
+            )
+        except Exception:
+            log.exception("recent lot card failed id=%s", lot_id)
+            plain = card.replace("*", "").replace("_", "")
+            await bot.send_message(
+                chat_id=chat_id, text=plain,
+                disable_web_page_preview=True, reply_markup=kb,
+            )
+
+    await bot.send_message(chat_id=chat_id, text="📱 Меню:", reply_markup=main_menu())
+
+
 async def show_latest(update: Update, *, edit_message=None, top_n: int = 12):
-    """Показать снимок последнего прогона из БД — без нового запуска."""
+    """Снимок последнего массового прогона (только если массовый режим включён)."""
+    if not is_mass_scraping_enabled():
+        await show_recent_checked(update, edit_message=edit_message, top_n=top_n)
+        return
     from database import get_latest_run, format_latest_run_messages
     from analyzer import format_short_lot_message, lot_action_keyboard
     run = get_latest_run()
@@ -230,8 +303,13 @@ async def _notify_tbankrot_disabled(bot, chat_id: str, *, edit_message=None):
 
 
 async def _run_agent_background(chat_id: str, cats, hot_only: bool, bot, label: str, region_filter=None):
-    if not is_tbankrot_enabled():
-        await _notify_tbankrot_disabled(bot, chat_id)
+    if not is_mass_scraping_enabled():
+        await bot.send_message(
+            chat_id=chat_id,
+            text=mass_scraping_disabled_message(),
+            parse_mode="Markdown",
+            reply_markup=reply_keyboard(),
+        )
         return
     from agent import run as agent_run
     stream_min = 9.0 if hot_only else 8.0
@@ -276,9 +354,14 @@ def _cats_for_run(cat: str):
 
 
 async def _launch_agent_run(chat_id: str, cat: str, bot):
-    """Запуск прогона — общая логика для inline и reply-кнопок."""
-    if not is_tbankrot_enabled():
-        await _notify_tbankrot_disabled(bot, chat_id)
+    """Запуск массового прогона — только если MASS_SCRAPING_ENABLED."""
+    if not is_mass_scraping_enabled():
+        await bot.send_message(
+            chat_id=chat_id,
+            text=mass_scraping_disabled_message(),
+            parse_mode="Markdown",
+            reply_markup=reply_keyboard(),
+        )
         return
     region_name = _user_region_name(chat_id)
     region_filter = _region_filter_for_agent(chat_id)
@@ -314,8 +397,8 @@ async def _launch_agent_run(chat_id: str, cat: str, bot):
 
 
 async def scheduled_agent_job(ctx: ContextTypes.DEFAULT_TYPE):
-    """Автопрогон по расписанию (08:00 / 19:00 МСК)."""
-    if not is_tbankrot_enabled():
+    """Автопрогон по расписанию (08:00 / 19:00 МСК) — только массовый режим."""
+    if not is_mass_scraping_enabled():
         return
     if _run_lock.locked():
         log.warning("scheduled agent skipped — already running")
@@ -377,12 +460,14 @@ def extract_lot_id(text: str):
 
 
 async def fetch_and_analyze_lot(lot_id: str):
-    """Парсит и анализирует лот. EGRN/рынок/Groq не должны ронять карточку."""
-    if not is_tbankrot_enabled():
-        raise RuntimeError("tbankrot parsing disabled (TBANKROT_ENABLED=0)")
+    """Парсит и анализирует один лот. EGRN/рынок/Groq не должны ронять карточку."""
+    if not is_single_lot_enabled():
+        raise RuntimeError(tbankrot_disabled_message())
     from playwright.async_api import async_playwright
-    from agent import enrich, login, launch_browser
+    from agent import enrich, login, launch_browser, page_access_blocked
     from analyzer import analyze_lot, minimal_lot_analysis
+
+    await asyncio.sleep(random.uniform(2, 5))
 
     url = f"https://tbankrot.ru/item?id={lot_id}"
     lot = {
@@ -406,10 +491,16 @@ async def fetch_and_analyze_lot(lot_id: str):
             page = await ctx.new_page()
             login_ok = await login(page)
             log.info("lot %s login_ok=%s", lot_id, login_ok)
+            if await page_access_blocked(page):
+                raise TbankrotAccessError(tbankrot_access_limited_message())
+            if not login_ok:
+                raise TbankrotAccessError(tbankrot_access_limited_message())
             try:
                 await enrich(lot, page, ctx, heavy=True)
             except Exception:
                 log.exception("lot %s enrich failed (continuing with card data)", lot_id)
+            if await page_access_blocked(page):
+                raise TbankrotAccessError(tbankrot_access_limited_message())
         finally:
             await browser.close()
 
@@ -539,13 +630,11 @@ user_region = {}
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "👋 *Банкротный агент*\n\n"
-        f"{platform_status_message()}\n"
-        "📋 /latest — готовые результаты без ожидания\n\n"
-        "Используйте меню внизу или inline-кнопки:",
+        f"{platform_status_message()}\n\n"
+        + analyze_lot_hint(),
         parse_mode="Markdown",
         reply_markup=reply_keyboard(),
     )
-    await update.message.reply_text("📱 Расширенное меню:", reply_markup=main_menu())
 
 
 async def cmd_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -609,19 +698,19 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         cached = lot_cache.get(lot_id, {})
         lot, an = cached.get("lot", {}), cached.get("an", {})
         if not (lot and an):
-            if not is_tbankrot_enabled():
+            if not is_single_lot_enabled():
                 await q.answer("Парсинг отключён", show_alert=True)
                 await q.message.reply_text(tbankrot_disabled_message(), parse_mode="Markdown")
                 return
             await q.answer("Загружаю лот...")
             try:
                 lot, an, parsed_at = await fetch_and_analyze_lot(lot_id)
-                lot_cache[lot_id] = {
-                    "lot": lot, "an": an,
-                    "cadastral": lot.get("cadastral", ""),
-                    "address": lot.get("address", ""),
-                    "parsed_at": int(parsed_at.timestamp()),
-                }
+                _cache_lot_result(lot_id, lot, an, parsed_at)
+                _record_checked_lot(q.message.chat_id, lot, an)
+            except TbankrotAccessError as exc:
+                await q.answer("tbankrot недоступен", show_alert=True)
+                await q.message.reply_text(str(exc), parse_mode="Markdown")
+                return
             except Exception:
                 log.exception("save failed for lot %s", lot_id)
                 await q.answer("Не удалось загрузить лот", show_alert=True)
@@ -646,7 +735,7 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 pass
         cached = lot_cache.get(lot_id, {})
         if not cached.get("an"):
-            if not is_tbankrot_enabled():
+            if not is_single_lot_enabled():
                 await q.answer("Парсинг отключён", show_alert=True)
                 await q.message.reply_text(
                     tbankrot_disabled_message() + "\n\n"
@@ -657,12 +746,12 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await q.answer("Загружаю лот...")
             try:
                 lot, an, parsed_at = await fetch_and_analyze_lot(lot_id)
-                lot_cache[lot_id] = {
-                    "lot": lot, "an": an,
-                    "cadastral": lot.get("cadastral", ""),
-                    "address": lot.get("address", ""),
-                    "parsed_at": int(parsed_at.timestamp()),
-                }
+                _cache_lot_result(lot_id, lot, an, parsed_at)
+                _record_checked_lot(q.message.chat_id, lot, an)
+            except TbankrotAccessError as exc:
+                await q.answer("tbankrot недоступен", show_alert=True)
+                await q.message.reply_text(str(exc), parse_mode="Markdown")
+                return
             except Exception:
                 log.exception("deep fetch failed for lot %s", lot_id)
         cached = lot_cache.get(lot_id, {})
@@ -696,9 +785,28 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 )
         return
 
-    if data == "latest":
+    if data == "latest" or data == "recent":
         await q.answer()
-        await show_latest(update, edit_message=q.message)
+        await show_recent_checked(update, edit_message=q.message)
+        return
+
+    if data == "help_analyze":
+        await q.answer()
+        await q.edit_message_text(analyze_lot_hint(), parse_mode="Markdown", reply_markup=main_menu())
+        return
+
+    if data == "saved":
+        await q.answer()
+        from database import get_saved_lots
+        items = get_saved_lots(q.message.chat_id)
+        if not items:
+            text = "⭐ *Сохранённые лоты пусты*\n\nНажмите «Сохранить» под любым лотом."
+        else:
+            text = "⭐ *Сохранённые лоты:*\n\n"
+            for item in items[:10]:
+                dl = f" | заявки до {item['deadline']}" if item.get("deadline") else ""
+                text += f"• {item['title'][:50]}\n  {item['url']}{dl}\n\n"
+        await q.edit_message_text(text, parse_mode="Markdown", reply_markup=main_menu(), disable_web_page_preview=True)
         return
 
     await q.answer()
@@ -708,6 +816,9 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text("📱 Меню:", reply_markup=main_menu())
 
     elif data == "menu_regions":
+        if not is_mass_scraping_enabled():
+            await q.edit_message_text(mass_scraping_disabled_message(), parse_mode="Markdown", reply_markup=main_menu())
+            return
         cur = user_region.get(chat, "moskva")
         cur_name = next((k for k,v in REGIONS.items() if v == cur), cur)
         await q.edit_message_text(
@@ -730,14 +841,16 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
 
     elif data == "menu_run" or data == "status":
+        if data == "menu_run" and not is_mass_scraping_enabled():
+            await q.edit_message_text(mass_scraping_disabled_message(), parse_mode="Markdown", reply_markup=main_menu())
+            return
         region = user_region.get(chat, "moskva")
         region_name = next((k for k,v in REGIONS.items() if v == region), region)
         if data == "status":
             await q.edit_message_text(
                 f"📊 *Статус*\n\n"
-                f"Регион: *{region_name}*\n"
-                f"{platform_status_message()}\n"
-                f"📋 /latest — последний снимок из базы",
+                f"{platform_status_message()}\n\n"
+                f"📋 «Последние проверенные» — ваши недавние лоты",
                 parse_mode="Markdown",
                 reply_markup=main_menu()
             )
@@ -749,15 +862,15 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             )
 
     elif data.startswith("run_"):
-        cat = data[4:]
-        if not is_tbankrot_enabled():
-            await _notify_tbankrot_disabled(ctx.bot, chat, edit_message=q.message)
+        if not is_mass_scraping_enabled():
+            await q.edit_message_text(mass_scraping_disabled_message(), parse_mode="Markdown", reply_markup=main_menu())
             return
+        cat = data[4:]
         if _run_lock.locked():
             await q.edit_message_text(
                 "⏳ *Уже идёт прогон*\n\n"
                 "Горячие лоты приходят по мере нахождения.\n"
-                "📋 /latest — прошлый готовый снимок",
+                "📋 «Последние проверенные» — ваши недавние лоты",
                 parse_mode="Markdown",
                 reply_markup=main_menu(),
             )
@@ -787,13 +900,26 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     text = (update.message.text or "").strip()
 
     if text in REPLY_BUTTONS:
-        if text == REPLY_LATEST:
-            await show_latest(update)
+        if text == REPLY_ANALYZE:
+            await update.message.reply_text(
+                analyze_lot_hint(), parse_mode="Markdown", reply_markup=reply_keyboard(),
+            )
+        elif text == REPLY_RECENT:
+            await show_recent_checked(update)
         elif text == REPLY_SAVED:
             await cmd_saved(update, ctx)
-        elif text == REPLY_HOT:
-            await _launch_agent_run(update.effective_chat.id, "hot", ctx.bot)
-        elif text == REPLY_RUN:
+        return
+
+    # Старые кнопки массового режима (если остались в клиенте)
+    if text == REPLY_HOT:
+        await _launch_agent_run(update.effective_chat.id, "hot", ctx.bot)
+        return
+    if text == REPLY_RUN:
+        if not is_mass_scraping_enabled():
+            await update.message.reply_text(
+                mass_scraping_disabled_message(), parse_mode="Markdown", reply_markup=reply_keyboard(),
+            )
+        else:
             region_name = _user_region_name(update.effective_chat.id)
             await update.message.reply_text(
                 f"🚀 *Запустить анализ*\n\nРегион: *{region_name}*\n\nВыберите категорию:",
@@ -804,7 +930,7 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     lot_id = extract_lot_id(text)
     if lot_id:
-        if not is_tbankrot_enabled():
+        if not is_single_lot_enabled():
             await update.message.reply_text(
                 tbankrot_disabled_message(),
                 parse_mode="Markdown",
@@ -819,20 +945,18 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
         try:
             lot, an, parsed_at = await fetch_and_analyze_lot(lot_id)
+        except TbankrotAccessError as exc:
+            await msg.edit_text(str(exc), parse_mode="Markdown")
+            return
         except Exception as exc:
             log.exception("link_analysis parse failed for lot %s: %r", lot_id, exc)
             await msg.edit_text(
                 f"⚠️ Не удалось спарсить лот {lot_id}.\n\n"
-                f"Проверьте ссылку или попробуйте позже.\n"
-                f"Подробности — в логах Railway (link_analysis parse failed).",
+                f"Проверьте ссылку или попробуйте позже.",
             )
             return
-        lot_cache[lot_id] = {
-            "lot": lot, "an": an,
-            "cadastral": lot.get("cadastral", ""),
-            "address": lot.get("address", ""),
-            "parsed_at": int(parsed_at.timestamp()),
-        }
+        _cache_lot_result(lot_id, lot, an, parsed_at)
+        _record_checked_lot(update.effective_chat.id, lot, an)
         kb = lot_action_keyboard(lot_id, an, lot, parsed_at)
         card_text = format_short_lot_message(lot, an)
         try:
@@ -865,19 +989,19 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     if len(text) > 3:
-        msg = await update.message.reply_text("💭 Думаю...", reply_markup=reply_keyboard())
-        answer = await ask_expert(text)
-        await msg.edit_text(answer)
+        await update.message.reply_text(
+            analyze_lot_hint(), parse_mode="Markdown", reply_markup=reply_keyboard(),
+        )
 
 def run():
     from database import init_db
     init_db()
-    if is_tbankrot_enabled():
+    if is_single_lot_enabled():
         from agent import ensure_playwright_env
         ensure_playwright_env()
-        log.info("TBANKROT enabled — Playwright env ready")
+        log.info("Single-lot mode — Playwright env ready")
     else:
-        log.info("TBANKROT disabled — bot only, no Playwright / no scheduled scraper")
+        log.info("Single-lot disabled — no Playwright init")
     try:
         from egrn_pdf import ocr_diagnostics
         d = ocr_diagnostics()
@@ -906,7 +1030,7 @@ def run():
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     if app.job_queue:
-        if is_tbankrot_enabled():
+        if is_mass_scraping_enabled():
             app.job_queue.run_daily(
                 scheduled_agent_job,
                 time=time(hour=8, minute=0, tzinfo=MSK),
@@ -919,13 +1043,16 @@ def run():
                 data={"slot": "19:00"},
                 name="agent_evening",
             )
-            log.info("Scheduled tbankrot agent jobs: 08:00 and 19:00 MSK")
+            log.info("Scheduled mass agent jobs: 08:00 and 19:00 MSK")
         else:
-            log.info("Scheduled tbankrot agent jobs: SKIPPED (TBANKROT_ENABLED=0)")
+            log.info("Scheduled mass agent jobs: SKIPPED (mass scraping disabled)")
         app.job_queue.run_repeating(check_reminders, interval=3600, first=120)
     else:
         log.warning("JobQueue недоступен — напоминания /saved отключены (нужен python-telegram-bot[job-queue])")
-    print("Bot started!" + (" (tbankrot OFF)" if not is_tbankrot_enabled() else ""))
+    mode = "single-lot" if is_single_lot_enabled() else "bot-only"
+    if is_mass_scraping_enabled():
+        mode += "+mass"
+    print(f"Bot started! ({mode})")
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
