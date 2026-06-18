@@ -21,6 +21,8 @@ from database import init_db, record_digest_lot, save_agent_run
 load_dotenv()
 log = logging.getLogger("agent")
 
+from platform_config import is_tbankrot_enabled
+
 LOGIN    = os.getenv("TBANKROT_LOGIN")
 PASSWORD = os.getenv("TBANKROT_PASSWORD")
 TG_TOKEN = os.getenv("TELEGRAM_TOKEN")
@@ -286,6 +288,10 @@ LAST_LOGIN_REASON = ""
 async def login(page) -> bool:
     global LAST_LOGIN_REASON
     LAST_LOGIN_REASON = ""
+    if not is_tbankrot_enabled():
+        LAST_LOGIN_REASON = "disabled"
+        log.info("[login] skipped — TBANKROT_ENABLED=0")
+        return False
     login_set = bool(LOGIN and LOGIN.strip())
     pwd_set = bool(PASSWORD and PASSWORD.strip())
     log.info("[login] TBANKROT_LOGIN set=%s TBANKROT_PASSWORD set=%s", login_set, pwd_set)
@@ -1106,6 +1112,9 @@ async def run(cats=None, include_extra=True, daily=True, *,
               stream_min_score=9.0, min_result_score=None,
               hot_only=False, region_filter=None):
     init_db()
+    if not is_tbankrot_enabled():
+        log.info("agent.run skipped — TBANKROT_ENABLED=0")
+        return {k: [] for k in CATEGORIES}
     if save_to_db is None:
         save_to_db = os.getenv("AGENT_SAVE_DB", "1") != "0"
     if cats is None:
@@ -1376,6 +1385,10 @@ if __name__ == "__main__":
         cat = sys.argv[idx+1] if idx+1 < len(sys.argv) else "квартира"
         asyncio.run(run(cats={cat}, include_extra=True, daily=True))
     else:
+        from platform_config import is_tbankrot_enabled
+        if not is_tbankrot_enabled():
+            print("TBANKROT disabled (TBANKROT_ENABLED=0). Telegram bot: python bot_main.py")
+            raise SystemExit(0)
         print("⏰ Запуск в 08:00 ежедневно")
         schedule.every().day.at("08:00").do(daily_job)
         while True:
