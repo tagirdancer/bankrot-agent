@@ -7,6 +7,7 @@ from telegram.ext import Application, CommandHandler, CallbackQueryHandler, Mess
 from dotenv import load_dotenv
 load_dotenv()
 
+from platform_config import is_tbankrot_enabled, platform_status_message, tbankrot_disabled_message
 from analyzer import MIN_DISCOUNT_PCT
 
 logging.basicConfig(level=logging.INFO,
@@ -217,7 +218,21 @@ async def cmd_latest(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await show_latest(update)
 
 
+async def _notify_tbankrot_disabled(bot, chat_id: str, *, edit_message=None):
+    text = tbankrot_disabled_message()
+    if edit_message is not None:
+        await edit_message.edit_text(text, parse_mode="Markdown", reply_markup=main_menu())
+    else:
+        await bot.send_message(
+            chat_id=chat_id, text=text,
+            parse_mode="Markdown", reply_markup=reply_keyboard(),
+        )
+
+
 async def _run_agent_background(chat_id: str, cats, hot_only: bool, bot, label: str, region_filter=None):
+    if not is_tbankrot_enabled():
+        await _notify_tbankrot_disabled(bot, chat_id)
+        return
     from agent import run as agent_run
     stream_min = 9.0 if hot_only else 8.0
     try:
@@ -262,6 +277,9 @@ def _cats_for_run(cat: str):
 
 async def _launch_agent_run(chat_id: str, cat: str, bot):
     """Запуск прогона — общая логика для inline и reply-кнопок."""
+    if not is_tbankrot_enabled():
+        await _notify_tbankrot_disabled(bot, chat_id)
+        return
     region_name = _user_region_name(chat_id)
     region_filter = _region_filter_for_agent(chat_id)
     cat_names = {
@@ -297,6 +315,8 @@ async def _launch_agent_run(chat_id: str, cat: str, bot):
 
 async def scheduled_agent_job(ctx: ContextTypes.DEFAULT_TYPE):
     """Автопрогон по расписанию (08:00 / 19:00 МСК)."""
+    if not is_tbankrot_enabled():
+        return
     if _run_lock.locked():
         log.warning("scheduled agent skipped — already running")
         return
@@ -358,6 +378,8 @@ def extract_lot_id(text: str):
 
 async def fetch_and_analyze_lot(lot_id: str):
     """Парсит и анализирует лот. EGRN/рынок/Groq не должны ронять карточку."""
+    if not is_tbankrot_enabled():
+        raise RuntimeError("tbankrot parsing disabled (TBANKROT_ENABLED=0)")
     from playwright.async_api import async_playwright
     from agent import enrich, login, launch_browser
     from analyzer import analyze_lot, minimal_lot_analysis
@@ -517,7 +539,7 @@ user_region = {}
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "👋 *Банкротный агент*\n\n"
-        "Автопрогоны: *08:00* и *19:00* (МСК)\n"
+        f"{platform_status_message()}\n"
         "📋 /latest — готовые результаты без ожидания\n\n"
         "Используйте меню внизу или inline-кнопки:",
         parse_mode="Markdown",
@@ -587,6 +609,10 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         cached = lot_cache.get(lot_id, {})
         lot, an = cached.get("lot", {}), cached.get("an", {})
         if not (lot and an):
+            if not is_tbankrot_enabled():
+                await q.answer("Парсинг отключён", show_alert=True)
+                await q.message.reply_text(tbankrot_disabled_message(), parse_mode="Markdown")
+                return
             await q.answer("Загружаю лот...")
             try:
                 lot, an, parsed_at = await fetch_and_analyze_lot(lot_id)
@@ -620,6 +646,14 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 pass
         cached = lot_cache.get(lot_id, {})
         if not cached.get("an"):
+            if not is_tbankrot_enabled():
+                await q.answer("Парсинг отключён", show_alert=True)
+                await q.message.reply_text(
+                    tbankrot_disabled_message() + "\n\n"
+                    "_Полный разбор по кнопке доступен только если карточка уже была в чате ранее._",
+                    parse_mode="Markdown",
+                )
+                return
             await q.answer("Загружаю лот...")
             try:
                 lot, an, parsed_at = await fetch_and_analyze_lot(lot_id)
@@ -702,9 +736,8 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await q.edit_message_text(
                 f"📊 *Статус*\n\n"
                 f"Регион: *{region_name}*\n"
-                f"Автопрогоны: *08:00* и *19:00* (МСК)\n"
-                f"📋 /latest — последний снимок из базы\n"
-                f"🚀 Ручной запуск — горячие лоты по мере нахождения",
+                f"{platform_status_message()}\n"
+                f"📋 /latest — последний снимок из базы",
                 parse_mode="Markdown",
                 reply_markup=main_menu()
             )
@@ -717,6 +750,9 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     elif data.startswith("run_"):
         cat = data[4:]
+        if not is_tbankrot_enabled():
+            await _notify_tbankrot_disabled(ctx.bot, chat, edit_message=q.message)
+            return
         if _run_lock.locked():
             await q.edit_message_text(
                 "⏳ *Уже идёт прогон*\n\n"
@@ -768,6 +804,13 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     lot_id = extract_lot_id(text)
     if lot_id:
+        if not is_tbankrot_enabled():
+            await update.message.reply_text(
+                tbankrot_disabled_message(),
+                parse_mode="Markdown",
+                reply_markup=reply_keyboard(),
+            )
+            return
         from analyzer import format_short_lot_message, lot_action_keyboard
         from telegram.error import BadRequest
         msg = await update.message.reply_text(
@@ -827,10 +870,14 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await msg.edit_text(answer)
 
 def run():
-    from agent import ensure_playwright_env
     from database import init_db
-    ensure_playwright_env()
     init_db()
+    if is_tbankrot_enabled():
+        from agent import ensure_playwright_env
+        ensure_playwright_env()
+        log.info("TBANKROT enabled — Playwright env ready")
+    else:
+        log.info("TBANKROT disabled — bot only, no Playwright / no scheduled scraper")
     try:
         from egrn_pdf import ocr_diagnostics
         d = ocr_diagnostics()
@@ -859,23 +906,26 @@ def run():
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     if app.job_queue:
-        app.job_queue.run_daily(
-            scheduled_agent_job,
-            time=time(hour=8, minute=0, tzinfo=MSK),
-            data={"slot": "08:00"},
-            name="agent_morning",
-        )
-        app.job_queue.run_daily(
-            scheduled_agent_job,
-            time=time(hour=19, minute=0, tzinfo=MSK),
-            data={"slot": "19:00"},
-            name="agent_evening",
-        )
+        if is_tbankrot_enabled():
+            app.job_queue.run_daily(
+                scheduled_agent_job,
+                time=time(hour=8, minute=0, tzinfo=MSK),
+                data={"slot": "08:00"},
+                name="agent_morning",
+            )
+            app.job_queue.run_daily(
+                scheduled_agent_job,
+                time=time(hour=19, minute=0, tzinfo=MSK),
+                data={"slot": "19:00"},
+                name="agent_evening",
+            )
+            log.info("Scheduled tbankrot agent jobs: 08:00 and 19:00 MSK")
+        else:
+            log.info("Scheduled tbankrot agent jobs: SKIPPED (TBANKROT_ENABLED=0)")
         app.job_queue.run_repeating(check_reminders, interval=3600, first=120)
-        log.info("Scheduled agent jobs: 08:00 and 19:00 MSK")
     else:
         log.warning("JobQueue недоступен — напоминания /saved отключены (нужен python-telegram-bot[job-queue])")
-    print("Bot started!")
+    print("Bot started!" + (" (tbankrot OFF)" if not is_tbankrot_enabled() else ""))
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
